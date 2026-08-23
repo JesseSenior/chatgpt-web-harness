@@ -1,222 +1,586 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
-  root, runDir, ensureDir, exists, readJson, readText, writeJson, writeText, now, sha256, pad,
-  makeRunId, parseInput, activePath, loadActive, saveActive, loadRun, event, loadWorkflow,
-  saveWorkflow, loadChecklist, saveChecklist, loadArtifacts, saveArtifacts, invalidateApproval,
-  openItems, nextRunnable, phaseOpenItems, nextCounter, slug, directive, baseChecklist, emit, fail
+  SCHEMA_VERSION, RECEIPT_PATTERN, activeFog, activePath, dependenciesDone, ensureDir,
+  errorCode, event, exists, fail, issueExecutionToken, issueReconcileToken, loadRun,
+  makeRunId, nextCounter, nextRunnable, normalizeDestination, normalizeFog,
+  normalizePlanItems, now, ok, openItems, pad, parseInput, readJson,
+  root, runDir, saveActive, saveWorkflow, sha256, validateExecutionToken,
+  validateReconcileToken, writeJson, writeText
 } from './lib.mjs';
+import { recordEvidence, verifiedEvidenceForCriterion, verifyEvidenceId } from './evidence-lib.mjs';
 
-function main() {
-  const action = process.argv[2];
-  if (!action) return fail('Usage: workflow.mjs <start|plan|next|complete|block|regenerate|interrupt|artifact|snapshot|stage|status> [json]', 'BAD_USAGE');
-  try {
-    const input = parseInput();
-    if (action === 'start') return start(input);
-    const { active, dir } = loadRun();
-    const wf = loadWorkflow(dir);
-    switch (action) {
-      case 'plan': return plan(active, dir, wf, input);
-      case 'next': return next(active, dir, wf);
-      case 'complete': return complete(active, dir, wf, input);
-      case 'block': return block(active, dir, wf, input);
-      case 'regenerate': return regenerate(active, dir, wf, input);
-      case 'interrupt': return interrupt(active, dir, wf, input);
-      case 'artifact': return artifact(active, dir, wf, input);
-      case 'snapshot': return snapshot(active, dir, wf, input);
-      case 'stage': return stage(active, dir, wf, input);
-      case 'status': return status(active, dir, wf);
-      default: return fail(`Unknown workflow action: ${action}`, 'BAD_USAGE');
+const REPLAN_REASONS = new Set([
+  'no_change',
+  'validated_observation',
+  'high_confidence_observation',
+  'tool_failure',
+  'dependency_change',
+  'check_failure',
+  'user_revision'
+]);
+
+function clearCandidate(dir) {
+  for (const name of ['draft.md', 'draft.json', 'release-token.json']) {
+    const file = path.join(dir, 'outbox', name);
+    if (exists(file)) fs.rmSync(file);
+  }
+}
+
+function observation(dir, id) {
+  const file = path.join(dir, 'observations', `${pad(Number(id))}.json`);
+  return exists(file) ? readJson(file) : null;
+}
+
+function effects(dir) {
+  return readJson(path.join(dir, 'effects.json'), { effects: [] });
+}
+
+function saveEffects(dir, value) {
+  writeJson(path.join(dir, 'effects.json'), value);
+}
+
+function pendingEffects(dir, itemId = null) {
+  return effects(dir).effects.filter(effect => effect.status === 'prepared' && (!itemId || effect.workflow_item_id === itemId));
+}
+
+function makeSnapshot(dir, wf, phase, summary = '') {
+  const id = nextCounter(dir, 'phase');
+  const file = path.join(dir, 'phases', `${pad(id, 3)}-${String(phase).replace(/[^a-z0-9-]+/gi, '-').toLowerCase()}.json`);
+  writeJson(file, {
+    id,
+    phase,
+    workflow_revision: wf.revision,
+    captured_at: now(),
+    summary: String(summary || ''),
+    item_statuses: wf.items.map(item => ({ id: item.id, status: item.status })),
+    current_item_id: wf.current_item_id,
+    active_fog_ids: activeFog(wf).map(item => item.id)
+  });
+  return file;
+}
+
+function executionDirective(active, dir, wf, item = null, eventName = 'item_issued', stateBefore = active.state) {
+  const issued = issueExecutionToken(active, dir, wf, item || nextRunnable(wf));
+  if (!issued) return null;
+  event(dir, eventName, active, {
+    state_before: stateBefore,
+    state_after: 'EXECUTE',
+    item_id: issued.item.id
+  });
+  return ok({
+    active,
+    wf,
+    nextItem: issued.item,
+    allowed: [
+      'evidence.record',
+      'observe.capture',
+      'workflow.effect_prepare',
+      'workflow.complete',
+      'workflow.block',
+      'workflow.snapshot'
+    ],
+    extra: {
+      execution_token: issued.token,
+      item: issued.item
     }
-  } catch (e) {
-    return fail(e?.stack || String(e), e?.message === 'NO_ACTIVE_RUN' ? 'NO_ACTIVE_RUN' : 'RUNTIME_ERROR');
-  }
-}
-
-main();
-
-function start(input) {
-  if (!input.request || typeof input.request !== 'string') return fail('start requires {"request":"..."}', 'BAD_INPUT');
-  ensureDir(root());
-  if (exists(activePath())) {
-    const existing = readJson(activePath());
-    if (!input.force_new) return fail(`Active run already exists: ${existing.run_id}. Use interrupt for a new user message or start with force_new:true only when intentionally forking/replacing.`, 'ACTIVE_RUN_EXISTS');
-  }
-  const run_id = makeRunId();
-  const dir = runDir(run_id);
-  for (const d of ['requests','observations','phases','checks','outbox']) ensureDir(path.join(dir,d));
-  writeText(path.join(dir,'requests','0001.md'), input.request.trim() + '\n');
-  writeJson(path.join(dir,'counters.json'), { event:0, observation:0, phase:0, check:0 });
-  const wf = {
-    version:1, run_id, revision:1, request_revision:1, created_at:now(), updated_at:now(),
-    items:[{
-      id:'bootstrap-plan', phase:'planning', objective:'Interpret the latest request and produce a durable workflow.',
-      status:'running', depends_on:[], acceptance:['A workflow graph and task-specific checklist are persisted before substantive task execution.'],
-      expected_evidence:['workflow plan'], evidence_refs:[], response_dependency:'none'
-    }]
-  };
-  writeJson(path.join(dir,'workflow.json'), wf);
-  writeJson(path.join(dir,'checklist.json'), { base:baseChecklist(), task:[] });
-  writeJson(path.join(dir,'artifacts.json'), { artifacts:[] });
-  const active = { version:1, run_id, request_revision:1, workflow_revision:1, state:'PLAN_ONLY', workspace:input.workspace || process.cwd(), created_at:now(), updated_at:now() };
-  saveActive(active);
-  saveWorkflow(dir, wf);
-  event(dir,'run_started',{ request_revision:1, workflow_revision:1 });
-  emit(directive({ active, wf, state:'PLAN_ONLY', next_item:wf.items[0],
-    allowed:['workflow.plan'],
-    forbidden:['task research','task drafting','artifact modification','final answer'],
-    prompt:'Before substantive task work, decompose the latest request into a minimal durable workflow. Include explicit acceptance criteria, dependencies, evidence requirements, and task-specific checklist items. Then call workflow.plan. Do not solve the task yet.' }));
-}
-
-function normalizeItems(items) {
-  if (!Array.isArray(items) || items.length === 0) throw new Error('plan/regenerate requires a non-empty items array');
-  const ids = new Set();
-  return items.map((x, idx) => {
-    const id = String(x.id || `item-${idx+1}`);
-    if (ids.has(id)) throw new Error(`duplicate workflow item id: ${id}`); ids.add(id);
-    return {
-      id, phase:String(x.phase || 'execution'), objective:String(x.objective || '').trim(),
-      status:'queued', depends_on:Array.isArray(x.depends_on) ? x.depends_on.map(String) : [],
-      acceptance:Array.isArray(x.acceptance) ? x.acceptance.map(String) : [],
-      expected_evidence:Array.isArray(x.expected_evidence) ? x.expected_evidence.map(String) : [],
-      evidence_refs:[], response_dependency:x.response_dependency || 'none'
-    };
   });
 }
 
-function plan(active, dir, wf, input) {
-  if (active.state !== 'PLAN_ONLY') return fail(`plan is only allowed in PLAN_ONLY; current=${active.state}`, 'INVALID_TRANSITION');
-  const fresh = normalizeItems(input.items);
-  const bootstrap = [...wf.items].reverse().find(i => i.status === 'running' && i.phase === 'planning' && i.id.startsWith('bootstrap-plan'));
-  if (bootstrap) {
-    bootstrap.status = 'done';
-    bootstrap.completed_at = now();
-    bootstrap.evidence_refs = [`workflow-plan:r${wf.revision + 1}`];
-  }
-  const used = new Set(wf.items.map(i => i.id));
-  for (const item of fresh) {
-    if (used.has(item.id)) item.id = `req${active.request_revision}-${item.id}`;
-    used.add(item.id);
-    wf.items.push(item);
-  }
-  wf.revision += 1;
-  wf.request_revision = active.request_revision;
-  const task = Array.isArray(input.checklist) ? input.checklist.map((x,i)=>({
-    id:String(x.id || `task-${i+1}`), text:String(x.text || x), evidence_required:x.evidence_required !== false, task_specific:true
-  })) : [];
-  saveChecklist(dir, { base:baseChecklist(), task });
-  active.workflow_revision = wf.revision; active.state='EXECUTE'; saveActive(active); invalidateApproval(dir,'workflow planned');
-  if (bootstrap) makeSnapshot(dir, wf, 'planning', 'completed', 'Workflow plan persisted before substantive execution.');
-  event(dir,'workflow_planned',{ workflow_revision:wf.revision, item_count:fresh.length, checklist_count:task.length });
-  const d = nextDirective(active, wf); saveWorkflow(dir,wf); emit(d);
+function reconcileDirective(active, dir, wf, sourceItemId, eventName, stateBefore) {
+  const token = issueReconcileToken(active, dir, wf, sourceItemId);
+  event(dir, eventName, active, {
+    state_before: stateBefore,
+    state_after: 'RECONCILE',
+    source_item_id: sourceItemId
+  });
+  return ok({
+    active,
+    wf,
+    allowed: ['workflow.reconcile', 'workflow.regenerate', 'observe.validate', 'observe.status'],
+    extra: {
+      reconcile_token: token,
+      source_item_id: sourceItemId,
+      fog: activeFog(wf)
+    }
+  });
 }
 
-function nextDirective(active, wf) {
+function advance(active, dir, wf, eventName, stateBefore, payload = {}) {
+  const runnable = nextRunnable(wf);
+  if (runnable) return executionDirective(active, dir, wf, runnable, eventName, stateBefore);
+  if (activeFog(wf).length) return reconcileDirective(active, dir, wf, 'fog', eventName, stateBefore);
   const open = openItems(wf);
-  if (!open.length) {
-    active.state='CHECK'; saveActive(active);
-    return directive({ active, wf, state:'CHECK', allowed:['workflow.stage','check.open'], forbidden:['final answer before check READY'],
-      prompt:'The durable workflow is empty. Stage the candidate user-facing response with workflow.stage, then call check.open. Do not answer the user before check returns READY.' });
+  if (open.length) {
+    active.state = 'WAIT_USER';
+    active.execution = null;
+    saveActive(active);
+    saveWorkflow(dir, wf);
+    event(dir, eventName, active, { state_before: stateBefore, state_after: 'WAIT_USER', ...payload });
+    return ok({ active, wf, allowed: ['workflow.interrupt', 'workflow.status'], extra: { open_items: open } });
   }
-  const item = nextRunnable(wf);
-  if (!item) {
-    active.state='WAIT_USER'; saveActive(active);
-    return directive({ active, wf, state:'WAIT_USER', allowed:['workflow.interrupt','workflow.stage'], forbidden:['claiming completion'],
-      prompt:'No workflow item is currently runnable. Resolve an explicit blocker or stage an interaction response only if a user-input/approval dependency cannot be resolved by available tools or best effort.',
-      extra:{ open_items:open } });
+  active.state = 'CHECK';
+  active.execution = null;
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  event(dir, eventName, active, { state_before: stateBefore, state_after: 'CHECK', ...payload });
+  return ok({ active, wf, allowed: ['workflow.stage'], extra: { destination: wf.destination } });
+}
+
+function start(input) {
+  if (!input.request || typeof input.request !== 'string') return fail('BAD_INPUT', { missing: ['request'] });
+  ensureDir(root());
+  if (exists(activePath()) && !input.force_new) {
+    const current = readJson(activePath());
+    return fail('INVALID_TRANSITION', { detail: `active run exists: ${current.run_id}`, allowed: ['workflow.interrupt', 'recover'] });
   }
-  if (item.status !== 'running') item.status='running';
-  active.state='EXECUTE'; saveActive(active);
-  return directive({ active, wf, state:'EXECUTE', next_item:item, allowed:['observe.capture','workflow.complete','workflow.block','workflow.artifact','workflow.snapshot'],
-    forbidden:['working on unrelated queued items unless explicitly independent','final answer'],
-    prompt:`Work only on workflow item ${item.id}: ${item.objective}. Use normal host tools as needed. Persist any material finding through observe.capture before depending on it later. Complete the item only with evidence references.` });
+  const runId = makeRunId();
+  const dir = runDir(runId);
+  for (const name of ['requests', 'observations', 'phases', 'checks', 'outbox', 'evidence', 'events', 'deliveries', 'releases']) {
+    ensureDir(path.join(dir, name));
+  }
+  const active = {
+    version: SCHEMA_VERSION,
+    run_id: runId,
+    request_revision: 1,
+    workflow_revision: 1,
+    state: 'PLAN_ONLY',
+    workspace: path.resolve(input.workspace || process.cwd()),
+    execution: null,
+    reconcile: null,
+    created_at: now(),
+    updated_at: now()
+  };
+  const wf = {
+    version: SCHEMA_VERSION,
+    run_id: runId,
+    revision: 1,
+    request_revision: 1,
+    destination: null,
+    items: [],
+    fog: [],
+    current_item_id: null,
+    created_at: now(),
+    updated_at: now()
+  };
+  writeText(path.join(dir, 'requests', '0001.md'), input.request.trim() + '\n');
+  writeJson(path.join(dir, 'counters.json'), {
+    observation: 0, evidence: 0, phase: 0, check: 0, delivery: 0, effect: 0
+  });
+  writeJson(path.join(dir, 'effects.json'), { effects: [] });
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  event(dir, 'run_started', active, { state_before: 'NONE', state_after: 'PLAN_ONLY' });
+  return ok({ active, wf, allowed: ['workflow.plan'] });
+}
+
+function plan(active, dir, wf, input) {
+  if (active.state !== 'PLAN_ONLY') return fail('INVALID_TRANSITION', { active, wf, allowed: ['workflow.status'] });
+  const destination = normalizeDestination(input.destination);
+  const existingIds = new Set(wf.items.map(item => item.id));
+  const items = normalizePlanItems(input.items, existingIds);
+  const fog = normalizeFog(input.fog || []);
+  wf.destination = destination;
+  wf.items.push(...items);
+  wf.fog.push(...fog);
+  wf.revision += 1;
+  wf.request_revision = active.request_revision;
+  active.workflow_revision = wf.revision;
+  active.reconcile = null;
+  clearCandidate(dir);
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  makeSnapshot(dir, wf, 'planning', 'Destination, frontier, and fog persisted.');
+  return advance(active, dir, wf, 'workflow_planned', 'PLAN_ONLY', { item_count: items.length, fog_count: fog.length });
 }
 
 function next(active, dir, wf) {
-  const d = nextDirective(active, wf); saveWorkflow(dir,wf); event(dir,'workflow_next',{ state:d.directive.state, item_id:d.directive.next_item?.id || null }); emit(d);
+  if (active.state === 'RECONCILE') return fail('RECONCILE_REQUIRED', { active, wf, allowed: ['workflow.reconcile'] });
+  if (active.state !== 'EXECUTE') return fail('INVALID_TRANSITION', { active, wf, allowed: ['workflow.status'] });
+  if (active.execution && !active.execution.used) {
+    return fail('INVALID_TRANSITION', { active, wf, allowed: ['workflow.complete', 'recover'], detail: 'current item already has a live token' });
+  }
+  const item = nextRunnable(wf);
+  if (!item) return advance(active, dir, wf, 'workflow_advanced', 'EXECUTE');
+  return executionDirective(active, dir, wf, item);
+}
+
+function resultMap(input) {
+  const values = Array.isArray(input.criterion_results) ? input.criterion_results : [];
+  return new Map(values.map(value => [
+    String(value.criterion_id || ''),
+    Array.isArray(value.evidence_ids) ? [...new Set(value.evidence_ids.map(Number))] : []
+  ]));
 }
 
 function complete(active, dir, wf, input) {
-  const id = String(input.item_id || '');
-  const item = wf.items.find(x=>x.id===id);
-  if (!item) return fail(`Unknown item_id: ${id}`, 'BAD_INPUT');
-  if (!['running','runnable','queued'].includes(item.status)) return fail(`Item ${id} cannot be completed from status ${item.status}`, 'INVALID_TRANSITION');
-  const evidence = Array.isArray(input.evidence_refs) ? input.evidence_refs.filter(Boolean).map(String) : [];
-  if ((item.expected_evidence.length || item.acceptance.length) && evidence.length === 0) return fail(`Item ${id} requires evidence_refs`, 'EVIDENCE_REQUIRED');
-  item.status='done'; item.completed_at=now(); item.evidence_refs=evidence; item.result=input.result ? String(input.result) : undefined;
-  invalidateApproval(dir,'workflow item completed');
-  saveWorkflow(dir,wf); event(dir,'item_completed',{ item_id:id, evidence_refs:evidence });
-  const phase = item.phase;
-  if (!phaseOpenItems(wf, phase).length) makeSnapshot(dir,wf,phase,'completed',input.phase_summary || null);
-  const d = nextDirective(active,wf); saveWorkflow(dir,wf); emit(d);
-}
-
-function block(active, dir, wf, input) {
-  const id=String(input.item_id||''); const item=wf.items.find(x=>x.id===id);
-  if (!item) return fail(`Unknown item_id: ${id}`, 'BAD_INPUT');
-  item.status='blocked'; item.blocker=String(input.reason||'unspecified blocker');
-  if (input.response_dependency) item.response_dependency=input.response_dependency;
-  saveWorkflow(dir,wf); invalidateApproval(dir,'workflow item blocked'); event(dir,'item_blocked',{item_id:id,reason:item.blocker});
-  const d = nextDirective(active,wf); saveWorkflow(dir,wf); emit(d);
-}
-
-function regenerate(active, dir, wf, input) {
-  const reason=String(input.reason||'replan requested'); const fresh=normalizeItems(input.items);
-  for (const old of wf.items) if (['queued','runnable','running','blocked'].includes(old.status)) { old.status='superseded'; old.superseded_at=now(); old.superseded_reason=reason; }
-  const used=new Set(wf.items.map(i=>i.id));
-  for (const n of fresh) { if (used.has(n.id)) n.id=`r${wf.revision+1}-${n.id}`; wf.items.push(n); }
-  wf.revision+=1; wf.request_revision=active.request_revision;
-  active.workflow_revision=wf.revision; active.state='EXECUTE'; saveActive(active); invalidateApproval(dir,'workflow regenerated');
-  if (Array.isArray(input.checklist)) {
-    const current=loadChecklist(dir); current.task=input.checklist.map((x,i)=>({id:String(x.id||`task-${i+1}`),text:String(x.text||x),evidence_required:x.evidence_required!==false,task_specific:true})); saveChecklist(dir,current);
+  const token = validateExecutionToken(active, wf, input.execution_token);
+  if (!token.valid) return fail(token.code, { active, wf, allowed: ['recover'] });
+  const item = wf.items.find(candidate => candidate.id === wf.current_item_id);
+  if (!item || item.status !== 'running' || !dependenciesDone(item, wf)) {
+    return fail('INVALID_TRANSITION', { active, wf, currentItem: item, allowed: ['recover'] });
   }
-  event(dir,'workflow_regenerated',{reason,workflow_revision:wf.revision}); const d=nextDirective(active,wf); saveWorkflow(dir,wf); emit(d);
+  const pending = pendingEffects(dir, item.id);
+  if (pending.length) return fail('PENDING_EFFECT', { active, wf, currentItem: item, missing: pending.map(effect => effect.operation_id) });
+  const provided = resultMap(input);
+  const failures = [];
+  const results = [];
+  for (const criterion of item.acceptance) {
+    const evidenceIds = provided.get(criterion.id) || [];
+    if (evidenceIds.length === 0) {
+      failures.push(criterion.id);
+      continue;
+    }
+    const verified = verifiedEvidenceForCriterion(active, dir, evidenceIds, criterion);
+    if (!verified.valid) {
+      failures.push(...verified.failures.map(detail => `${criterion.id}: ${detail}`));
+      continue;
+    }
+    results.push({ criterion_id: criterion.id, evidence_ids: evidenceIds });
+  }
+  if (failures.length) return fail('EVIDENCE_REQUIRED', { active, wf, currentItem: item, missing: failures });
+  active.execution.used = true;
+  active.execution.used_at = now();
+  item.status = 'done';
+  item.completed_at = now();
+  item.criterion_results = results;
+  item.result = input.result ? String(input.result) : null;
+  wf.current_item_id = null;
+  makeSnapshot(dir, wf, item.id, input.summary || '');
+  clearCandidate(dir);
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  if (item.kind === 'knowledge') {
+    return reconcileDirective(active, dir, wf, item.id, 'knowledge_item_completed', 'EXECUTE');
+  }
+  return advance(active, dir, wf, 'item_completed', 'EXECUTE', { item_id: item.id });
+}
+
+function invalidateCascade(wf, roots) {
+  const unknown = roots.filter(id => !wf.items.some(item => item.id === id));
+  if (unknown.length) {
+    throw Object.assign(new Error(`items not found: ${unknown.join(', ')}`), { code: 'INVALID_PLAN' });
+  }
+  const affected = new Set(roots);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of wf.items) {
+      if (!affected.has(item.id) && item.depends_on.some(id => affected.has(id))) {
+        affected.add(item.id);
+        changed = true;
+      }
+    }
+  }
+  const replacementIds = new Map([...affected].map(id => [id, `redo-r${wf.revision + 1}-${id}`]));
+  const replacements = [];
+  for (const id of affected) {
+    const item = wf.items.find(candidate => candidate.id === id);
+    if (!item || ['superseded', 'invalidated'].includes(item.status)) continue;
+    item.status = item.status === 'done' ? 'invalidated' : 'superseded';
+    item.invalidated_at = now();
+    replacements.push({
+      id: replacementIds.get(id),
+      kind: item.kind,
+      objective: `Re-evaluate after invalidation: ${item.objective}`,
+      status: 'queued',
+      depends_on: item.depends_on.map(dependency => replacementIds.get(dependency) || dependency),
+      acceptance: item.acceptance,
+      criterion_results: [],
+      replaces: id,
+      created_at: now()
+    });
+  }
+  wf.items.push(...replacements);
+  return { affected: [...affected], replacements: replacements.map(item => item.id) };
+}
+
+function applyFogChanges(wf, changes, canInvalidate, newItems) {
+  const graduate = Array.isArray(changes?.graduate) ? changes.graduate.map(String) : [];
+  const exclude = Array.isArray(changes?.exclude) ? changes.exclude.map(String) : [];
+  const add = normalizeFog(changes?.add || []);
+  if (exclude.length && !canInvalidate) {
+    throw Object.assign(new Error('excluding fog requires validated knowledge'), { code: 'INVALID_REPLAN_REASON' });
+  }
+  if (graduate.length && newItems.length === 0) {
+    throw Object.assign(new Error('graduating fog requires new items'), { code: 'INVALID_PLAN' });
+  }
+  for (const id of graduate) {
+    const entry = wf.fog.find(candidate => candidate.id === id && candidate.status === 'fog');
+    if (!entry) throw Object.assign(new Error(`fog entry not found: ${id}`), { code: 'INVALID_PLAN' });
+    entry.status = 'graduated';
+    entry.resolved_at = now();
+  }
+  for (const id of exclude) {
+    const entry = wf.fog.find(candidate => candidate.id === id && candidate.status === 'fog');
+    if (!entry) throw Object.assign(new Error(`fog entry not found: ${id}`), { code: 'INVALID_PLAN' });
+    entry.status = 'excluded';
+    entry.resolved_at = now();
+  }
+  const existing = new Set(wf.fog.map(entry => entry.id));
+  if (add.some(entry => existing.has(entry.id))) {
+    throw Object.assign(new Error('duplicate fog id'), { code: 'INVALID_PLAN' });
+  }
+  wf.fog.push(...add);
+}
+
+function reconcile(active, dir, wf, input) {
+  const token = validateReconcileToken(active, wf, input.reconcile_token);
+  if (!token.valid) return fail(token.code, { active, wf, allowed: ['recover'] });
+  const decision = String(input.decision || '');
+  const reasonCode = String(input.reason_code || '');
+  if (!['no_change', 'expand', 'supersede'].includes(decision) || !REPLAN_REASONS.has(reasonCode)) {
+    return fail('INVALID_REPLAN_REASON', { active, wf, missing: ['decision/reason_code'] });
+  }
+  const observationIds = Array.isArray(input.observation_ids) ? input.observation_ids.map(Number) : [];
+  const observations = observationIds.map(id => observation(dir, id)).filter(Boolean);
+  const hasValidated = observations.some(record => record.status === 'validated');
+  const hasHighConfidence = observations.some(record => ['high_confidence', 'validated'].includes(record.status));
+  const systemReason = ['tool_failure', 'dependency_change', 'check_failure', 'user_revision'].includes(reasonCode);
+  if (decision !== 'no_change' && !hasHighConfidence && !systemReason) {
+    return fail('INVALID_REPLAN_REASON', { active, wf, missing: ['high-confidence or validated observation'] });
+  }
+  const supersedes = Array.isArray(input.supersedes) ? input.supersedes.map(String) : [];
+  const hasFogChanges = ['graduate', 'exclude', 'add'].some(key => (input.fog_changes?.[key] || []).length);
+  if (decision === 'no_change' && (reasonCode !== 'no_change' || supersedes.length || (input.items || []).length || hasFogChanges)) {
+    return fail('INVALID_REPLAN_REASON', { active, wf, detail: 'no_change cannot modify the route' });
+  }
+  if (decision !== 'no_change' && reasonCode === 'no_change') {
+    return fail('INVALID_REPLAN_REASON', { active, wf, detail: 'route changes require an evidence-backed reason' });
+  }
+  if (decision === 'expand' && supersedes.length) {
+    return fail('INVALID_REPLAN_REASON', { active, wf, detail: 'expand cannot supersede existing items' });
+  }
+  const touchesDone = supersedes.some(id => wf.items.find(item => item.id === id)?.status === 'done');
+  if (touchesDone && !hasValidated) {
+    return fail('INVALID_REPLAN_REASON', { active, wf, missing: ['validated observation for completed work'] });
+  }
+  const existingIds = new Set(wf.items.map(item => item.id));
+  const newItems = Array.isArray(input.items) && input.items.length
+    ? normalizePlanItems(input.items, existingIds)
+    : [];
+  let invalidation = { affected: [], replacements: [] };
+  if (decision === 'supersede' && supersedes.length) {
+    invalidation = invalidateCascade(wf, supersedes);
+  }
+  if (decision === 'expand' || decision === 'supersede') wf.items.push(...newItems);
+  applyFogChanges(wf, input.fog_changes || {}, hasValidated, newItems);
+  active.reconcile.used = true;
+  active.reconcile.used_at = now();
+  wf.revision += 1;
+  active.workflow_revision = wf.revision;
+  active.reconcile = null;
+  clearCandidate(dir);
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  return advance(active, dir, wf, 'workflow_reconciled', 'RECONCILE', {
+    decision,
+    reason_code: reasonCode,
+    observation_ids: observationIds,
+    supersedes,
+    invalidation,
+    new_item_ids: newItems.map(item => item.id)
+  });
+}
+
+export function interruptRun(active, dir, wf, request) {
+  const text = String(request || '').trim();
+  if (!text) throw Object.assign(new Error('interrupt requires request text'), { code: 'BAD_INPUT' });
+  const previousState = active.state;
+  active.request_revision += 1;
+  active.workflow_revision = wf.revision + 1;
+  active.state = 'PLAN_ONLY';
+  active.execution = null;
+  active.reconcile = null;
+  active.release_id = null;
+  writeText(path.join(dir, 'requests', `${pad(active.request_revision, 4)}.md`), text + '\n');
+  for (const item of wf.items) {
+    if (['queued', 'running', 'blocked'].includes(item.status)) {
+      item.status = 'superseded';
+      item.superseded_at = now();
+      item.superseded_reason = 'new user request revision';
+    }
+  }
+  for (const entry of wf.fog) {
+    if (entry.status === 'fog') {
+      entry.status = 'superseded';
+      entry.resolved_at = now();
+    }
+  }
+  wf.current_item_id = null;
+  wf.revision += 1;
+  wf.request_revision = active.request_revision;
+  clearCandidate(dir);
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  event(dir, 'user_interrupt', active, {
+    state_before: previousState,
+    state_after: 'PLAN_ONLY',
+    request_revision: active.request_revision
+  });
+  return { active, dir, wf };
 }
 
 function interrupt(active, dir, wf, input) {
-  if (!input.request || typeof input.request!=='string') return fail('interrupt requires {"request":"..."}', 'BAD_INPUT');
-  active.request_revision+=1; active.workflow_revision=wf.revision+1; active.state='PLAN_ONLY';
-  writeText(path.join(dir,'requests',`${pad(active.request_revision,4)}.md`), input.request.trim()+'\n');
-  for (const i of wf.items) if (['queued','runnable','running','blocked'].includes(i.status)) { i.status='superseded'; i.superseded_at=now(); i.superseded_reason='new user interrupt'; }
-  wf.revision+=1; wf.request_revision=active.request_revision;
-  wf.items.push({ id:`bootstrap-plan-r${active.request_revision}`, phase:'planning', objective:'Interpret the latest request revision and regenerate the durable workflow.', status:'running', depends_on:[], acceptance:['Latest request revision is represented by a new workflow plan.'], expected_evidence:['workflow plan'], evidence_refs:[], response_dependency:'none' });
-  saveActive(active); invalidateApproval(dir,'new user request');
-  const draft=path.join(dir,'outbox','draft.md'); if(exists(draft)) fs.rmSync(draft);
-  const draftMeta=path.join(dir,'outbox','draft.json'); if(exists(draftMeta)) fs.rmSync(draftMeta);
-  saveWorkflow(dir,wf); event(dir,'user_interrupt',{request_revision:active.request_revision,workflow_revision:wf.revision});
-  emit(directive({active,wf,state:'PLAN_ONLY',next_item:wf.items.at(-1),allowed:['workflow.plan'],forbidden:['continuing stale plan','using prior READY approval','final answer'],prompt:'A new user request revision invalidated prior approval and open work. Re-read the latest request from durable state and call workflow.plan with a regenerated workflow before substantive work.'}));
+  interruptRun(active, dir, wf, input.request);
+  return ok({ active, wf, allowed: ['workflow.plan'] });
+}
+
+function block(active, dir, wf, input) {
+  const token = validateExecutionToken(active, wf, input.execution_token);
+  if (!token.valid) return fail(token.code, { active, wf, allowed: ['recover'] });
+  const item = wf.items.find(candidate => candidate.id === wf.current_item_id);
+  if (input.response_dependency && input.response_dependency !== 'user_input') {
+    return fail('BAD_INPUT', { active, wf, missing: ['response_dependency:user_input|none'] });
+  }
+  item.status = 'blocked';
+  item.blocker = String(input.reason || 'missing task input');
+  active.execution.used = true;
+  wf.current_item_id = null;
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  if (input.response_dependency === 'user_input') {
+    const previousState = active.state;
+    active.state = 'WAIT_USER';
+    saveActive(active);
+    event(dir, 'item_blocked', active, { state_before: previousState, state_after: 'WAIT_USER', item_id: item.id });
+    return ok({ active, wf, allowed: ['workflow.interrupt', 'workflow.status'], extra: { blocker: item.blocker } });
+  }
+  return reconcileDirective(active, dir, wf, item.id, 'item_blocked', 'EXECUTE');
 }
 
 function artifact(active, dir, wf, input) {
-  if (!input.path && !input.ref) return fail('artifact requires path or ref', 'BAD_INPUT');
-  const data=loadArtifacts(dir); const id=String(input.id || `artifact-${data.artifacts.length+1}`);
-  const rec={id, path:input.path?String(input.path):undefined, ref:input.ref?String(input.ref):undefined, description:input.description?String(input.description):undefined, workflow_revision:wf.revision, recorded_at:now()};
-  if (rec.path) { const p=path.isAbsolute(rec.path)?rec.path:path.resolve(process.cwd(),rec.path); if(exists(p)&&fs.statSync(p).isFile()) rec.sha256=sha256(fs.readFileSync(p)); }
-  data.artifacts=data.artifacts.filter(a=>a.id!==id); data.artifacts.push(rec); saveArtifacts(dir,data); invalidateApproval(dir,'artifact registry changed'); event(dir,'artifact_recorded',{id,path:rec.path,ref:rec.ref});
-  emit(directive({active,wf,state:active.state,next_item:nextRunnable(wf),allowed:['workflow.next','observe.capture','workflow.complete'],forbidden:['claiming unverified artifact integrity'],prompt:`Artifact ${id} is durably registered. Continue the current workflow item and reference this artifact as evidence where appropriate.`,extra:{artifact:rec}}));
+  const record = recordEvidence(active, dir, { ...input, type: 'artifact', workflow_item_id: wf.current_item_id });
+  return ok({ active, wf, allowed: ['workflow.complete', 'evidence.verify'], extra: { evidence: record } });
 }
 
-function makeSnapshot(dir,wf,phase,status,summary=null) {
-  const n=nextCounter(dir,'phase'); const items=wf.items.filter(i=>i.phase===phase);
-  const lines=[`# Phase ${n}: ${phase}`,'',`- Status: ${status}`,`- Workflow revision: ${wf.revision}`,`- Captured: ${now()}`,'', '## Objective / items','',...items.map(i=>`- [${i.status}] ${i.id}: ${i.objective}`),'','## Validated evidence','',...items.flatMap(i=>(i.evidence_refs||[]).map(e=>`- ${i.id}: ${e}`))];
-  if(summary) lines.push('','## Summary','',String(summary));
-  const p=path.join(dir,'phases',`${pad(n,3)}-${slug(phase)}.md`); writeText(p,lines.join('\n')+'\n'); event(dir,'phase_snapshot',{phase,status,path:p}); return p;
+function effectPrepare(active, dir, wf, input) {
+  const token = validateExecutionToken(active, wf, input.execution_token);
+  if (!token.valid) return fail(token.code, { active, wf, allowed: ['recover'] });
+  const operationId = String(input.operation_id || '').trim();
+  const idempotencyKey = String(input.idempotency_key || '').trim();
+  if (!operationId || !idempotencyKey || !input.target) {
+    return fail('BAD_INPUT', { active, wf, missing: ['operation_id/idempotency_key/target'] });
+  }
+  const data = effects(dir);
+  if (data.effects.some(effect => effect.operation_id === operationId)) {
+    return fail('BAD_INPUT', { active, wf, detail: 'operation_id already exists' });
+  }
+  const record = {
+    id: nextCounter(dir, 'effect'),
+    operation_id: operationId,
+    idempotency_key: idempotencyKey,
+    target: String(input.target),
+    workflow_item_id: wf.current_item_id,
+    status: 'prepared',
+    prepared_at: now()
+  };
+  data.effects.push(record);
+  saveEffects(dir, data);
+  event(dir, 'effect_prepared', active, { operation_id: operationId, item_id: wf.current_item_id });
+  return ok({ active, wf, allowed: ['evidence.record', 'workflow.effect_complete'], extra: { effect: record } });
 }
-function snapshot(active,dir,wf,input){ const phase=String(input.phase || nextRunnable(wf)?.phase || 'current'); const p=makeSnapshot(dir,wf,phase,input.status||'suspended',input.summary||null); emit(directive({active,wf,state:active.state,next_item:nextRunnable(wf),allowed:['workflow.next','workflow.stage'],forbidden:['forgetting unresolved work'],prompt:`Phase state persisted at ${p}. Continue from durable workflow state; this snapshot is a lossy recovery artifact, not a replacement for primary artifacts.`,extra:{snapshot:p}})); }
+
+function effectComplete(active, dir, wf, input) {
+  const data = effects(dir);
+  const record = data.effects.find(effect => effect.operation_id === String(input.operation_id || ''));
+  if (!record) return fail('NOT_FOUND', { active, wf, missing: [String(input.operation_id || '')] });
+  const evidence = verifyEvidenceId(active, dir, Number(input.evidence_id));
+  if (!evidence.valid) return fail('EVIDENCE_INVALID', { active, wf, missing: [String(input.evidence_id || '')] });
+  record.status = 'completed';
+  record.evidence_id = evidence.record.id;
+  record.completed_at = now();
+  saveEffects(dir, data);
+  event(dir, 'effect_completed', active, { operation_id: record.operation_id, evidence_id: record.evidence_id });
+  return ok({ active, wf, allowed: ['workflow.complete'], extra: { effect: record } });
+}
+
+function snapshot(active, dir, wf, input) {
+  const file = makeSnapshot(dir, wf, input.phase || wf.current_item_id || 'current', input.summary || '');
+  event(dir, 'snapshot_created', active, { snapshot: file });
+  return ok({ active, wf, allowed: ['workflow.complete', 'workflow.status'], extra: { snapshot: file } });
+}
 
 function stage(active, dir, wf, input) {
-  const mode=String(input.mode||''); const content=String(input.content||'');
-  if (!['final','interaction','progress'].includes(mode) || !content.trim()) return fail('stage requires mode final|interaction|progress and non-empty content', 'BAD_INPUT');
-  const open=openItems(wf);
-  if (mode==='final' && open.length) return fail(`Cannot stage final response with ${open.length} open workflow item(s).`, 'WORKFLOW_NOT_EMPTY');
-  if (mode==='interaction' && !open.some(i=>i.status==='blocked' && ['user_input','approval'].includes(i.response_dependency))) return fail('interaction mode requires an explicit blocked user_input/approval item', 'INVALID_INTERACTION');
-  if (mode==='progress' && !open.length) return fail('progress mode is only for incomplete workflows', 'INVALID_PROGRESS');
-  invalidateApproval(dir,'new draft staged');
-  writeText(path.join(dir,'outbox','draft.md'),content);
-  writeJson(path.join(dir,'outbox','draft.json'),{mode,run_id:active.run_id,request_revision:active.request_revision,workflow_revision:wf.revision,sha256:sha256(content),staged_at:now()});
-  active.state='CHECK'; saveActive(active); event(dir,'response_staged',{mode,sha256:sha256(content)});
-  emit(directive({active,wf,state:'CHECK',allowed:['check.open'],forbidden:['sending staged draft','editing draft outside runtime'],prompt:'A user-facing response is staged but not approved. Call check.open now. Do not answer the user from outbox/draft.md unless the mandatory check returns READY.'}));
+  const mode = String(input.mode || '');
+  if (mode !== 'final') return fail('BAD_INPUT', { active, wf, detail: 'only final responses use the release gate' });
+  const content = String(input.content || '');
+  if (!content.trim()) return fail('BAD_INPUT', { active, wf, missing: ['content'] });
+  if (RECEIPT_PATTERN.test(content)) return fail('RESERVED_RECEIPT', { active, wf });
+  if (active.state !== 'CHECK' || openItems(wf).length || activeFog(wf).length) {
+    return fail('WORKFLOW_NOT_EMPTY', {
+      active,
+      wf,
+      missing: [...openItems(wf).map(item => item.id), ...activeFog(wf).map(item => item.id)]
+    });
+  }
+  const coverage = resultMap({ criterion_results: input.coverage });
+  const failures = [];
+  const normalizedCoverage = [];
+  for (const criterion of wf.destination.success_criteria) {
+    const evidenceIds = coverage.get(criterion.id) || [];
+    const verified = verifiedEvidenceForCriterion(active, dir, evidenceIds, criterion);
+    if (!verified.valid) {
+      failures.push(criterion.id, ...verified.failures);
+    } else {
+      normalizedCoverage.push({ criterion_id: criterion.id, evidence_ids: evidenceIds });
+    }
+  }
+  if (failures.length) return fail('EVIDENCE_REQUIRED', { active, wf, missing: failures });
+  clearCandidate(dir);
+  writeText(path.join(dir, 'outbox', 'draft.md'), content);
+  writeJson(path.join(dir, 'outbox', 'draft.json'), {
+    mode: 'final',
+    run_id: active.run_id,
+    request_revision: active.request_revision,
+    workflow_revision: wf.revision,
+    body_sha256: sha256(content),
+    coverage: normalizedCoverage,
+    staged_at: now()
+  });
+  event(dir, 'response_staged', active, { body_sha256: sha256(content) });
+  return ok({ active, wf, allowed: ['check.open'] });
 }
 
-function status(active,dir,wf){ emit(directive({active,wf,state:active.state,next_item:nextRunnable(wf),allowed:['workflow.next','recover','check.open'],forbidden:['inferring completion from conversation memory'],prompt:'Use this durable status as authoritative. Continue with the next permitted runtime call.',extra:{open_items:openItems(wf),current:path.join(dir,'CURRENT.md')}})); }
+function status(active, dir, wf) {
+  return ok({
+    active,
+    wf,
+    allowed: ['recover', 'workflow.next', 'workflow.reconcile', 'workflow.stage'],
+    extra: {
+      current: path.join(dir, 'CURRENT.md'),
+      open_items: openItems(wf),
+      fog: activeFog(wf),
+      pending_effects: pendingEffects(dir)
+    }
+  });
+}
+
+function main() {
+  const action = process.argv[2];
+  if (!action) return fail('BAD_USAGE');
+  try {
+    const input = parseInput();
+    if (action === 'start') return start(input);
+    const { active, dir, wf } = loadRun();
+    if (action === 'plan') return plan(active, dir, wf, input);
+    if (action === 'next') return next(active, dir, wf);
+    if (action === 'complete') return complete(active, dir, wf, input);
+    if (action === 'block') return block(active, dir, wf, input);
+    if (action === 'reconcile' || action === 'regenerate') return reconcile(active, dir, wf, input);
+    if (action === 'interrupt') return interrupt(active, dir, wf, input);
+    if (action === 'artifact') return artifact(active, dir, wf, input);
+    if (action === 'effect_prepare') return effectPrepare(active, dir, wf, input);
+    if (action === 'effect_complete') return effectComplete(active, dir, wf, input);
+    if (action === 'snapshot') return snapshot(active, dir, wf, input);
+    if (action === 'stage') return stage(active, dir, wf, input);
+    if (action === 'status') return status(active, dir, wf);
+    return fail('BAD_USAGE', { active, wf });
+  } catch (error) {
+    return fail(errorCode(error), { detail: error.message });
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

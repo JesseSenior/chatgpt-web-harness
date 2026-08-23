@@ -2,126 +2,394 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { canonical, lastEventHash, sha256, verifyEventChain } from './audit.mjs';
 import {
-  parseInput, loadRun, loadWorkflow, loadChecklist, loadArtifacts, readJson, readText, writeJson, writeText,
-  exists, sha256, nextCounter, pad, now, openItems, nextRunnable, verifyArtifacts, invalidateApproval,
-  saveWorkflow, saveActive, event, directive, emit, fail
+  EVIDENCE_TYPES, activeFog, errorCode, event, exists, fail, loadRun, nextCounter,
+  now, ok, openItems, pad, parseInput, randomToken, readJson, readText, saveActive,
+  saveWorkflow, writeJson, writeText
 } from './lib.mjs';
+import { verifyEvidenceId, verifiedEvidenceForCriterion } from './evidence-lib.mjs';
 
-function main() {
-  const action=process.argv[2];
-  if(!action) return fail('Usage: check.mjs <open|submit|consume> [json]', 'BAD_USAGE');
-  try {
-    const input=parseInput();
-    const {active,dir}=loadRun();
-    const wf=loadWorkflow(dir);
-    if(action==='open') return openCheck(active,dir,wf);
-    if(action==='submit') return submitCheck(active,dir,wf,input);
-    if(action==='consume') return consume(active,dir,wf,input);
-    return fail(`Unknown check action: ${action}`,'BAD_USAGE');
-  } catch(e) { return fail(e?.stack||String(e),'RUNTIME_ERROR'); }
-}
+const MODEL_CHECKS = [
+  { id: 'destination-answer', text: 'The final response answers the stable destination.' },
+  { id: 'user-constraints', text: 'The final response satisfies the persisted user constraints.' },
+  { id: 'grounded-claims', text: 'Material final-response claims are supported by verified evidence.' }
+];
 
 function draftState(dir) {
-  const metaPath=path.join(dir,'outbox','draft.json'); const bodyPath=path.join(dir,'outbox','draft.md');
-  if(!exists(metaPath)||!exists(bodyPath)) throw new Error('NO_STAGED_DRAFT');
-  const meta=readJson(metaPath); const body=readText(bodyPath); return {meta,body,hash:sha256(body)};
+  const bodyFile = path.join(dir, 'outbox', 'draft.md');
+  const metaFile = path.join(dir, 'outbox', 'draft.json');
+  if (!exists(bodyFile) || !exists(metaFile)) return null;
+  const body = readText(bodyFile);
+  return { body, meta: readJson(metaFile), body_sha256: sha256(body) };
 }
 
-function allChecklist(dir) {
-  const c=loadChecklist(dir); return [...(c.base||[]),...(c.task||[])];
+function releaseMetaPath(dir, id) {
+  return path.join(dir, 'releases', `${pad(Number(id))}.json`);
 }
 
-function mechanical(active,dir,wf,draft) {
-  const open=openItems(wf); const artifactFailures=verifyArtifacts(dir);
-  const acceptanceFailures=wf.items.filter(i=>i.status==='done' && ((i.acceptance||[]).length||(i.expected_evidence||[]).length) && !(i.evidence_refs||[]).length).map(i=>i.id);
-  const phaseFiles=exists(path.join(dir,'phases')) ? fs.readdirSync(path.join(dir,'phases')).filter(f=>f.endsWith('.md')) : [];
-  return {
-    'latest-request': { pass:draft.meta.request_revision===active.request_revision, detail:`draft request r${draft.meta.request_revision}; active r${active.request_revision}` },
-    'workflow-empty-final': { pass:draft.meta.mode!=='final' || open.length===0, detail:`mode=${draft.meta.mode}; open=${open.length}` },
-    'acceptance-evidence': { pass:acceptanceFailures.length===0, detail:acceptanceFailures.length?`missing evidence: ${acceptanceFailures.join(', ')}`:'all completed evidence-bearing items have evidence refs' },
-    'artifact-integrity': { pass:artifactFailures.length===0, detail:artifactFailures.length?artifactFailures.join('; '):'registered path artifacts exist and hashes match' },
-    'draft-exact': { pass:draft.hash===draft.meta.sha256 && draft.meta.workflow_revision===wf.revision && draft.meta.request_revision===active.request_revision, detail:`hash=${draft.hash}; staged=${draft.meta.sha256}; draft wf=${draft.meta.workflow_revision}; active wf=${wf.revision}` },
-    '_mode': { pass:(draft.meta.mode==='final'&&open.length===0)||(draft.meta.mode==='progress'&&open.length>0)||(draft.meta.mode==='interaction'&&open.some(i=>i.status==='blocked'&&['user_input','approval'].includes(i.response_dependency))), detail:`mode=${draft.meta.mode}; open=${open.length}` },
-    '_phase': { pass:phaseFiles.length>0 || !wf.items.some(i=>i.status==='done'), detail:`phase snapshots=${phaseFiles.length}` }
-  };
+function releaseBodyPath(dir, id) {
+  return path.join(dir, 'releases', `${pad(Number(id))}.md`);
 }
 
-function openCheck(active,dir,wf) {
-  const draft=draftState(dir); const checklist=allChecklist(dir); const mech=mechanical(active,dir,wf,draft);
-  const id=nextCounter(dir,'check');
-  const record={id,opened_at:now(),status:'OPEN',run_id:active.run_id,request_revision:active.request_revision,workflow_revision:wf.revision,draft_sha256:draft.hash,mode:draft.meta.mode,checklist,mechanical_at_open:mech};
-  writeJson(path.join(dir,'checks',`${pad(id)}.json`),record); event(dir,'check_opened',{check_id:id,mode:draft.meta.mode,draft_sha256:draft.hash});
-  emit(directive({active,wf,state:'CHECK',allowed:['check.submit'],forbidden:['answering user','skipping checklist items','asserting mechanical checks without runtime evidence'],
-    prompt:'Read and evaluate every checklist item below against the latest durable request, workflow, artifacts, observations, and staged response. Submit one yes/no assessment per item with a reason and evidence_refs. Do not omit items. Mechanical conditions will be recomputed independently on submit; model confidence cannot override them.',
-    extra:{check_id:id,mode:draft.meta.mode,staged_response:draft.body,checklist,mechanical_preview:mech,current:readText(path.join(dir,'CURRENT.md'),'')} }));
+function loadRelease(dir, id) {
+  const metaFile = releaseMetaPath(dir, id);
+  const bodyFile = releaseBodyPath(dir, id);
+  if (!exists(metaFile) || !exists(bodyFile)) return null;
+  return { meta: readJson(metaFile), body: readText(bodyFile) };
 }
 
-function normalizeAnswers(input) {
-  const arr=Array.isArray(input.answers)?input.answers:[]; const map=new Map();
-  for(const a of arr) if(a&&a.id) map.set(String(a.id),{id:String(a.id),answer:String(a.answer||'').toLowerCase(),reason:String(a.reason||''),evidence_refs:Array.isArray(a.evidence_refs)?a.evidence_refs.map(String):[]});
-  return map;
+function effectFailures(dir) {
+  const data = readJson(path.join(dir, 'effects.json'), { effects: [] });
+  return data.effects.filter(effect => effect.status !== 'completed').map(effect => effect.operation_id);
 }
 
-function submitCheck(active,dir,wf,input) {
-  const checkId=Number(input.check_id); if(!checkId) return fail('submit requires check_id','BAD_INPUT');
-  const checkPath=path.join(dir,'checks',`${pad(checkId)}.json`); if(!exists(checkPath)) return fail(`Check ${checkId} not found`,'NOT_FOUND');
-  const rec=readJson(checkPath); if(rec.status!=='OPEN') return fail(`Check ${checkId} is not OPEN`,'INVALID_TRANSITION');
-  const draft=draftState(dir); const checklist=allChecklist(dir); const answers=normalizeAnswers(input); const mech=mechanical(active,dir,wf,draft);
-  const failures=[];
-  if(rec.request_revision!==active.request_revision) failures.push({id:'stale-check',reason:'request revision changed after check.open'});
-  if(rec.workflow_revision!==wf.revision) failures.push({id:'stale-check',reason:'workflow revision changed after check.open'});
-  if(rec.draft_sha256!==draft.hash) failures.push({id:'stale-draft',reason:'draft changed after check.open'});
-  if(!mech._mode.pass) failures.push({id:'mode-compatibility',reason:mech._mode.detail});
-  if(!mech._phase.pass) failures.push({id:'persistence-complete',reason:'completed work exists but no phase snapshot is persisted'});
-  for(const item of checklist) {
-    const a=answers.get(item.id);
-    if(!a) { failures.push({id:item.id,reason:'checklist item omitted'}); continue; }
-    if(a.answer!=='yes') failures.push({id:item.id,reason:a.reason||'model assessment is not yes'});
-    if(item.evidence_required && a.evidence_refs.length===0) failures.push({id:item.id,reason:'evidence_refs required'});
-    if(mech[item.id] && !mech[item.id].pass) failures.push({id:item.id,reason:mech[item.id].detail});
+function itemEvidenceFailures(active, dir, wf) {
+  const failures = [];
+  for (const item of wf.items.filter(candidate => candidate.status === 'done')) {
+    const map = new Map((item.criterion_results || []).map(result => [result.criterion_id, result.evidence_ids]));
+    for (const criterion of item.acceptance) {
+      const ids = map.get(criterion.id) || [];
+      const result = verifiedEvidenceForCriterion(active, dir, ids, criterion);
+      if (!result.valid) failures.push(`${item.id}/${criterion.id}`);
+    }
   }
-  rec.submitted_at=now(); rec.answers=[...answers.values()]; rec.mechanical_at_submit=mech;
-  if(failures.length) return reject(active,dir,wf,draft,rec,checkPath,failures);
-  return approve(active,dir,wf,draft,rec,checkPath);
+  return failures;
 }
 
-function reject(active,dir,wf,draft,rec,checkPath,failures) {
-  rec.status='BLOCKED'; rec.failures=failures; writeJson(checkPath,rec); invalidateApproval(dir,'check failed');
-  const uniq=[]; const seen=new Set(); for(const f of failures){if(!seen.has(f.id)){seen.add(f.id);uniq.push(f);}}
-  for(const old of wf.items) if(['queued','runnable','running','blocked'].includes(old.status)){old.status='superseded';old.superseded_at=now();old.superseded_reason=`check ${rec.id} failed`;}
-  const base=`check-${rec.id}`;
-  uniq.forEach((f,i)=>wf.items.push({id:`${base}-${i+1}`,phase:'remediation',objective:`Remediate failed check '${f.id}': ${f.reason}`,status:'queued',depends_on:[],acceptance:[`Check '${f.id}' can be answered yes with durable evidence.`],expected_evidence:['remediation evidence'],evidence_refs:[],response_dependency:'none'}));
-  wf.revision+=1; active.workflow_revision=wf.revision; active.state='EXECUTE'; saveActive(active); saveWorkflow(dir,wf); event(dir,'check_failed',{check_id:rec.id,failures:uniq,workflow_revision:wf.revision});
-  emit(directive({active,wf,state:'EXECUTE',next_item:nextRunnable(wf),allowed:['workflow.next','observe.capture','workflow.complete'],forbidden:['sending rejected draft','claiming completion','manually flipping checklist results'],
-    prompt:`Check ${rec.id} failed and generated remediation workflow items. Resume the workflow now. After remediation, stage a fresh response and run a new check; the rejected draft is not approved.`,extra:{failures:uniq,rejected_draft_sha256:draft.hash}}));
+function coverageFailures(active, dir, wf, draft) {
+  const map = new Map((draft?.meta.coverage || []).map(result => [result.criterion_id, result.evidence_ids]));
+  const failures = [];
+  for (const criterion of wf.destination.success_criteria) {
+    const result = verifiedEvidenceForCriterion(active, dir, map.get(criterion.id) || [], criterion);
+    if (!result.valid) failures.push(criterion.id);
+  }
+  return failures;
 }
 
-function approve(active,dir,wf,draft,rec,checkPath) {
-  const token=crypto.randomBytes(18).toString('base64url'); rec.status=draft.meta.mode==='final'?'READY':'APPROVED'; rec.approved_at=now(); rec.approval_token_hash=sha256(token); writeJson(checkPath,rec);
-  writeText(path.join(dir,'outbox','approved.md'),draft.body);
-  writeJson(path.join(dir,'outbox','approval.json'),{token_hash:sha256(token),check_id:rec.id,run_id:active.run_id,request_revision:active.request_revision,workflow_revision:wf.revision,draft_sha256:draft.hash,mode:draft.meta.mode,approved_at:now(),used:false});
-  const state=draft.meta.mode==='final'?'READY':draft.meta.mode==='progress'?'PROGRESS_ONLY':'WAIT_USER'; active.state=state; saveActive(active); event(dir,'check_approved',{check_id:rec.id,mode:draft.meta.mode,draft_sha256:draft.hash});
-  const prompt=draft.meta.mode==='final'
-    ? 'READY. Do not send yet. Call check.consume with the approval token; only consume may release the response for user delivery.'
-    : draft.meta.mode==='progress'
-      ? 'The progress response is approved but not yet released. Call check.consume with the approval token; only then may it be sent.'
-      : 'The interaction response is approved but not yet released. Call check.consume with the approval token; only then may it be sent.';
-  emit(directive({active,wf,state,allowed:['check.consume'],forbidden:['editing approved response','claiming additional untracked work'],prompt,extra:{approval_token:token,approved_path:path.join(dir,'outbox','approved.md'),draft_sha256:draft.hash,check_id:rec.id}}));
+function mechanical(active, dir, wf, draft) {
+  const audit = verifyEventChain(dir);
+  const failures = [];
+  if (!draft) failures.push('missing-draft');
+  if (draft && draft.meta.body_sha256 !== draft.body_sha256) failures.push('draft-hash');
+  if (draft && (draft.meta.request_revision !== active.request_revision || draft.meta.workflow_revision !== wf.revision)) {
+    failures.push('stale-draft');
+  }
+  failures.push(...openItems(wf).map(item => `open-item:${item.id}`));
+  failures.push(...activeFog(wf).map(item => `active-fog:${item.id}`));
+  failures.push(...effectFailures(dir).map(id => `pending-effect:${id}`));
+  failures.push(...itemEvidenceFailures(active, dir, wf).map(id => `item-evidence:${id}`));
+  if (draft) failures.push(...coverageFailures(active, dir, wf, draft).map(id => `destination-evidence:${id}`));
+  if (!audit.valid) failures.push(...audit.failures.map(value => `audit:${value}`));
+  if (audit.valid && audit.replay_state !== active.state) failures.push('audit:active state mismatch');
+  return { pass: failures.length === 0, failures, audit };
 }
 
-function consume(active,dir,wf,input) {
-  const approvalPath=path.join(dir,'outbox','approval.json');
-  const approvedPath=path.join(dir,'outbox','approved.md');
-  if(!exists(approvalPath)||!exists(approvedPath)) return fail('No current approved response','NO_APPROVAL');
-  const approval=readJson(approvalPath);
-  if(approval.used) return fail('Approval token already consumed','APPROVAL_ALREADY_USED');
-  if(!input.approval_token || sha256(String(input.approval_token))!==approval.token_hash) return fail('Invalid approval token','BAD_APPROVAL_TOKEN');
-  const approved=readText(approvedPath);
-  const draft=draftState(dir);
-  if(approval.request_revision!==active.request_revision || approval.workflow_revision!==wf.revision || approval.draft_sha256!==sha256(approved) || draft.hash!==approval.draft_sha256) return fail('Approval is stale relative to current durable state','STALE_APPROVAL');
-  approval.used=true; approval.used_at=now(); writeJson(approvalPath,approval); event(dir,'approval_consumed',{check_id:approval.check_id,mode:approval.mode});
-  emit(directive({active,wf,state:active.state,allowed:['send approved_response exactly once'],forbidden:['editing approved response','reusing approval token'],prompt:'This is the final gate. Send approved_response exactly as returned, with no substantive edits. The approval token is now consumed and cannot be reused.',extra:{approved_response:approved,mode:approval.mode,check_id:approval.check_id,draft_sha256:approval.draft_sha256}}));
+function remediation(active, dir, wf, checkRecord, failures) {
+  checkRecord.status = 'BLOCKED';
+  checkRecord.failures = failures;
+  checkRecord.completed_at = now();
+  writeJson(path.join(dir, 'checks', `${pad(checkRecord.id)}.json`), checkRecord);
+  const revision = wf.revision + 1;
+  const ids = new Set(wf.items.map(item => item.id));
+  failures.forEach((reason, index) => {
+    let id = `check-${checkRecord.id}-${index + 1}`;
+    while (ids.has(id)) id = `r${revision}-${id}`;
+    ids.add(id);
+    wf.items.push({
+      id,
+      kind: 'execution',
+      objective: `Remediate final check failure: ${reason}`,
+      status: 'queued',
+      depends_on: [],
+      acceptance: [{
+        id: 'resolved',
+        text: `The final check failure '${reason}' is resolved.`,
+        evidence_types: [...EVIDENCE_TYPES]
+      }],
+      criterion_results: [],
+      created_at: now(),
+      triggered_by_check: checkRecord.id
+    });
+  });
+  wf.revision = revision;
+  wf.current_item_id = null;
+  active.workflow_revision = revision;
+  active.state = 'EXECUTE';
+  active.execution = null;
+  saveActive(active);
+  saveWorkflow(dir, wf);
+  event(dir, 'check_failed', active, {
+    state_before: 'CHECK',
+    state_after: 'EXECUTE',
+    check_id: checkRecord.id,
+    failures
+  });
+  return fail('CHECK_FAILED', { active, wf, missing: failures, allowed: ['workflow.next'] });
+}
+
+function openCheck(active, dir, wf) {
+  if (active.state !== 'CHECK') return fail('INVALID_TRANSITION', { active, wf, allowed: ['workflow.status'] });
+  const draft = draftState(dir);
+  const result = mechanical(active, dir, wf, draft);
+  if (result.failures.some(value => value.startsWith('audit:'))) {
+    return fail('RUNTIME_ERROR', { active, wf, missing: result.failures.filter(value => value.startsWith('audit:')) });
+  }
+  const id = nextCounter(dir, 'check');
+  const record = {
+    id,
+    status: 'OPEN',
+    opened_at: now(),
+    run_id: active.run_id,
+    request_revision: active.request_revision,
+    workflow_revision: wf.revision,
+    draft_sha256: draft?.body_sha256 || null,
+    model_checks: MODEL_CHECKS,
+    mechanical: result
+  };
+  writeJson(path.join(dir, 'checks', `${pad(id)}.json`), record);
+  if (!result.pass) return remediation(active, dir, wf, record, result.failures);
+  event(dir, 'check_opened', active, { check_id: id, draft_sha256: draft.body_sha256 });
+  return ok({ active, wf, allowed: ['check.submit'], extra: { check_id: id, checks: MODEL_CHECKS } });
+}
+
+function normalizedAnswers(input) {
+  const answers = Array.isArray(input.answers) ? input.answers : [];
+  return new Map(answers.map(answer => [
+    String(answer.id || ''),
+    {
+      answer: String(answer.answer || '').toLowerCase(),
+      evidence_ids: Array.isArray(answer.evidence_ids) ? [...new Set(answer.evidence_ids.map(Number))] : []
+    }
+  ]));
+}
+
+function submitCheck(active, dir, wf, input) {
+  if (active.state !== 'CHECK') return fail('INVALID_TRANSITION', { active, wf });
+  const id = Number(input.check_id);
+  const file = path.join(dir, 'checks', `${pad(id)}.json`);
+  if (!id || !exists(file)) return fail('NOT_FOUND', { active, wf, missing: [String(input.check_id || '')] });
+  const record = readJson(file);
+  if (record.status !== 'OPEN') return fail('INVALID_TRANSITION', { active, wf });
+  const draft = draftState(dir);
+  const mechanicalResult = mechanical(active, dir, wf, draft);
+  if (!mechanicalResult.pass || record.workflow_revision !== wf.revision || record.draft_sha256 !== draft?.body_sha256) {
+    return remediation(active, dir, wf, record, [...mechanicalResult.failures, 'stale-open-check']);
+  }
+  const answers = normalizedAnswers(input);
+  const failures = [];
+  const storedAnswers = [];
+  for (const check of MODEL_CHECKS) {
+    const answer = answers.get(check.id);
+    if (!answer || answer.answer !== 'yes' || answer.evidence_ids.length === 0) {
+      failures.push(check.id);
+      continue;
+    }
+    const invalid = answer.evidence_ids.filter(evidenceId => !verifyEvidenceId(active, dir, evidenceId).valid);
+    if (invalid.length) {
+      failures.push(...invalid.map(evidenceId => `${check.id}:${evidenceId}`));
+      continue;
+    }
+    storedAnswers.push({ id: check.id, answer: 'yes', evidence_ids: answer.evidence_ids });
+  }
+  record.answers = storedAnswers;
+  record.submitted_at = now();
+  if (failures.length) return remediation(active, dir, wf, record, failures);
+
+  const releaseId = record.id;
+  const releaseToken = randomToken();
+  const release = {
+    id: releaseId,
+    status: 'ready',
+    run_id: active.run_id,
+    request_revision: active.request_revision,
+    workflow_revision: wf.revision,
+    check_id: record.id,
+    body_sha256: draft.body_sha256,
+    token_hash: sha256(releaseToken),
+    ready_at: now()
+  };
+  writeText(releaseBodyPath(dir, releaseId), draft.body);
+  writeJson(releaseMetaPath(dir, releaseId), release);
+  record.status = 'READY';
+  record.release_id = releaseId;
+  writeJson(file, record);
+  active.state = 'READY';
+  active.release_id = releaseId;
+  saveActive(active);
+  event(dir, 'check_ready', active, {
+    state_before: 'CHECK',
+    state_after: 'READY',
+    check_id: record.id,
+    release_id: releaseId,
+    body_sha256: draft.body_sha256
+  });
+  return ok({ active, wf, allowed: ['check.consume'], extra: { release_token: releaseToken, release_id: releaseId } });
+}
+
+function createDelivery(active, dir, wf, release) {
+  const deliveryId = nextCounter(dir, 'delivery');
+  const nonce = crypto.randomBytes(32).toString('hex');
+  const material = {
+    receipt_id: `${active.run_id}:${deliveryId}`,
+    run_id: active.run_id,
+    request_revision: release.meta.request_revision,
+    workflow_revision: release.meta.workflow_revision,
+    check_id: release.meta.check_id,
+    release_id: release.meta.id,
+    delivery_sequence: deliveryId,
+    body_sha256: release.meta.body_sha256,
+    nonce,
+    previous_event_sha256: lastEventHash(dir)
+  };
+  const receiptSha256 = sha256(canonical(material));
+  const record = {
+    ...material,
+    receipt_sha256: receiptSha256,
+    delivered_at: now()
+  };
+  event(dir, 'delivery_created', active, {
+    delivery_id: deliveryId,
+    release_id: release.meta.id,
+    receipt_sha256: receiptSha256,
+    receipt_material: material
+  });
+  writeJson(path.join(dir, 'deliveries', `${pad(deliveryId)}.json`), record);
+  const releasedResponse = `${release.body}\n\nWorkflow-Receipt: sha256:${receiptSha256}`;
+  return { record, releasedResponse };
+}
+
+function consume(active, dir, wf, input) {
+  if (active.state !== 'READY') return fail('INVALID_TRANSITION', { active, wf, allowed: ['recover'] });
+  const release = loadRelease(dir, active.release_id);
+  if (!release) return fail('NO_FINAL_RELEASE', { active, wf });
+  if (release.meta.status !== 'ready' || sha256(String(input.release_token || '')) !== release.meta.token_hash) {
+    return fail('BAD_RELEASE_TOKEN', { active, wf });
+  }
+  const audit = verifyEventChain(dir);
+  if (!audit.valid || audit.replay_state !== 'READY' || sha256(release.body) !== release.meta.body_sha256) {
+    return fail('RUNTIME_ERROR', { active, wf, missing: audit.failures });
+  }
+  release.meta.status = 'consumed';
+  release.meta.consumed_at = now();
+  delete release.meta.token_hash;
+  writeJson(releaseMetaPath(dir, release.meta.id), release.meta);
+  active.state = 'CONSUMED';
+  saveActive(active);
+  event(dir, 'final_consumed', active, {
+    state_before: 'READY',
+    state_after: 'CONSUMED',
+    release_id: release.meta.id
+  });
+  const delivery = createDelivery(active, dir, wf, release);
+  return ok({
+    active,
+    wf,
+    allowed: ['send released_response exactly', 'check.redeliver', 'check.verify'],
+    extra: {
+      released_response: delivery.releasedResponse,
+      receipt_sha256: delivery.record.receipt_sha256,
+      delivery_id: delivery.record.delivery_sequence
+    }
+  });
+}
+
+function redeliver(active, dir, wf) {
+  if (active.state !== 'CONSUMED') return fail('INVALID_TRANSITION', { active, wf, allowed: ['recover'] });
+  const release = loadRelease(dir, active.release_id);
+  if (!release || release.meta.status !== 'consumed') return fail('NO_FINAL_RELEASE', { active, wf });
+  if (sha256(release.body) !== release.meta.body_sha256) return fail('RUNTIME_ERROR', { active, wf, missing: ['frozen final body'] });
+  const delivery = createDelivery(active, dir, wf, release);
+  return ok({
+    active,
+    wf,
+    allowed: ['send released_response exactly', 'check.redeliver', 'check.verify'],
+    extra: {
+      released_response: delivery.releasedResponse,
+      receipt_sha256: delivery.record.receipt_sha256,
+      delivery_id: delivery.record.delivery_sequence
+    }
+  });
+}
+
+function deliveryRecords(dir, events = []) {
+  const directory = path.join(dir, 'deliveries');
+  const records = !exists(directory) ? [] : fs.readdirSync(directory)
+    .filter(name => /^\d{6}\.json$/.test(name))
+    .sort()
+    .map(name => readJson(path.join(directory, name)));
+  const known = new Set(records.map(record => record.receipt_sha256));
+  for (const eventRecord of events.filter(record => record.type === 'delivery_created')) {
+    const receipt = eventRecord.payload.receipt_sha256;
+    if (!known.has(receipt) && eventRecord.payload.receipt_material) {
+      records.push({
+        ...eventRecord.payload.receipt_material,
+        receipt_sha256: receipt,
+        delivered_at: eventRecord.at
+      });
+    }
+  }
+  return records;
+}
+
+function verifyReceipt(active, dir, wf, input) {
+  const receipt = String(input.receipt || '').replace(/^sha256:/i, '').trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(receipt)) return fail('RECEIPT_INVALID', { active, wf, missing: ['receipt'] });
+  const audit = verifyEventChain(dir);
+  if (!audit.valid || audit.replay_state !== active.state) {
+    return fail('RECEIPT_INVALID', { active, wf, missing: audit.failures });
+  }
+  const delivery = deliveryRecords(dir, audit.events).find(record => record.receipt_sha256 === receipt);
+  if (!delivery) return fail('RECEIPT_INVALID', { active, wf, missing: [receipt] });
+  const { receipt_sha256: stored, delivered_at, ...material } = delivery;
+  void delivered_at;
+  if (sha256(canonical(material)) !== stored) return fail('RECEIPT_INVALID', { active, wf, missing: ['receipt material'] });
+  const release = loadRelease(dir, delivery.release_id);
+  if (!release || sha256(release.body) !== delivery.body_sha256) {
+    return fail('RECEIPT_INVALID', { active, wf, missing: ['release body'] });
+  }
+  if (input.content) {
+    const footer = new RegExp(`\\n\\nWorkflow-Receipt:\\s*sha256:${receipt}\\s*$`, 'i');
+    const body = String(input.content).replace(footer, '');
+    if (sha256(body) !== delivery.body_sha256) return fail('RECEIPT_INVALID', { active, wf, missing: ['provided content'] });
+  }
+  const matchingEvent = audit.events.find(eventRecord =>
+    eventRecord.type === 'delivery_created' && eventRecord.payload.receipt_sha256 === receipt
+  );
+  if (!matchingEvent) return fail('RECEIPT_INVALID', { active, wf, missing: ['delivery event'] });
+  if (canonical(matchingEvent.payload.receipt_material) !== canonical(material)) {
+    return fail('RECEIPT_INVALID', { active, wf, missing: ['delivery event material'] });
+  }
+  return ok({
+    active,
+    wf,
+    allowed: ['check.verify', 'check.redeliver'],
+    extra: {
+      valid: true,
+      receipt_sha256: receipt,
+      release_id: delivery.release_id,
+      body_sha256: delivery.body_sha256,
+      delivery_sequence: delivery.delivery_sequence,
+      audit_head_sha256: audit.head_sha256
+    }
+  });
+}
+
+function main() {
+  const action = process.argv[2];
+  if (!action) return fail('BAD_USAGE');
+  try {
+    const input = parseInput();
+    const { active, dir, wf } = loadRun();
+    if (action === 'open') return openCheck(active, dir, wf);
+    if (action === 'submit') return submitCheck(active, dir, wf, input);
+    if (action === 'consume') return consume(active, dir, wf, input);
+    if (action === 'redeliver') return redeliver(active, dir, wf);
+    if (action === 'verify') return verifyReceipt(active, dir, wf, input);
+    return fail('BAD_USAGE', { active, wf });
+  } catch (error) {
+    return fail(errorCode(error), { detail: error.message });
+  }
 }
 
 main();
