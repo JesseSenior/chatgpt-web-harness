@@ -7,7 +7,7 @@ import { PROJECT } from './helpers.mjs';
 test('SKILL.md stays short and routes continuation to the runtime', () => {
   const skill = fs.readFileSync(path.join(PROJECT, 'SKILL.md'), 'utf8');
   assert.ok(skill.split('\n').length <= 40);
-  assert.match(skill, /^---\nname: durable-chatgpt-workflow\n/m);
+  assert.match(skill, /^---\nname: chatgpt-web-harness\n/m);
   assert.match(skill, /skill-continue-or-finalize/);
   assert.doesNotMatch(skill, /references\//);
 });

@@ -1,9 +1,9 @@
 ---
-name: durable-chatgpt-workflow
+name: chatgpt-web-harness
 description: Run a fixed durable workflow when explicitly requested; also resume an active run when a message contains skill-continue-or-finalize.
 ---
 
-# Durable ChatGPT Workflow
+# ChatGPT Web Harness
 
 Use the fixed scripts from this skill directory as the only workflow runtime.
 

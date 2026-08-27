@@ -1,4 +1,4 @@
-# durable-chatgpt-workflow
+# ChatGPT Web Harness
 
 ## Use with ChatGPT Web
 
