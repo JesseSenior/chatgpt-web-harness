@@ -7,11 +7,15 @@ description: Run a fixed durable workflow when explicitly requested; also resume
 
 Use the fixed scripts from this skill directory as the only workflow runtime.
 
-For a new task, call `workflow.start` before task reasoning, then make only the calls returned in `allowed_next_calls`.
+For a new task, the only action allowed before `workflow.start` is locating and reading the latest `SKILL.md` plus the minimum path information required to invoke the script. Do not send commentary, reason about the task, inspect README or runtime files, or use other host tools first.
+
+Call `workflow.start` immediately with the complete user request. Then make only the calls returned in `allowed_next_calls`.
 
 When a user message contains `skill-continue-or-finalize`, pass the entire message to `recover` before any other task action. The runtime treats remaining text as a request revision.
 
 Treat runtime state, tokens, evidence results, and errors as authoritative. Apply only the repair named by an error.
+
+The scripts enforce runtime action permissions. The host instruction above governs text and host tools because a skill ZIP cannot block host output before the first script call.
 
 Use `evidence` and `observe` for durable facts. Use normal host tools only while the current execution token is active.
 

@@ -18,6 +18,13 @@ export function canonical(value) {
   return JSON.stringify(value);
 }
 
+export function permissionDigest(permissionRevision, allowedNextCalls) {
+  return sha256(canonical({
+    permission_revision: permissionRevision,
+    allowed_next_calls: allowedNextCalls
+  }));
+}
+
 function atomicWrite(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
@@ -61,6 +68,7 @@ export function verifyEventChain(runDirectory) {
   const events = readEvents(runDirectory);
   let previous = null;
   let replayState = null;
+  let replayPermission = null;
   const failures = [];
 
   for (let index = 0; index < events.length; index += 1) {
@@ -75,8 +83,38 @@ export function verifyEventChain(runDirectory) {
       }
       replayState = event.payload.state_after;
     }
+    if (event.type === 'permissions_issued') {
+      const revision = event.payload?.permission_revision;
+      const calls = event.payload?.allowed_next_calls;
+      const normalized = Array.isArray(calls) ? [...new Set(calls.map(String))].sort() : null;
+      const expectedRevision = (replayPermission?.permission_revision || 0) + 1;
+      if (!normalized || canonical(calls) !== canonical(normalized)) {
+        failures.push(`event ${event.seq}: invalid permission calls`);
+      }
+      if (!Number.isInteger(revision) || revision !== expectedRevision) {
+        failures.push(`event ${event.seq}: invalid permission revision`);
+      }
+      if (normalized && event.payload.permission_sha256 !== permissionDigest(revision, normalized)) {
+        failures.push(`event ${event.seq}: invalid permission hash`);
+      }
+      if (normalized && Number.isInteger(revision)) {
+        replayPermission = {
+          permission_revision: revision,
+          allowed_next_calls: normalized,
+          permission_sha256: event.payload.permission_sha256,
+          event_sha256
+        };
+      }
+    }
     previous = event_sha256;
   }
 
-  return { valid: failures.length === 0, failures, events, replay_state: replayState, head_sha256: previous };
+  return {
+    valid: failures.length === 0,
+    failures,
+    events,
+    replay_state: replayState,
+    replay_permission: replayPermission,
+    head_sha256: previous
+  };
 }

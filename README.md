@@ -1,10 +1,12 @@
 # ChatGPT Web Harness
 
-ChatGPT Web Harness is a durable workflow skill for long-running tasks in ChatGPT Web. It keeps workflow state in the workspace, issues one-use execution tokens, records evidence for acceptance criteria, and resumes interrupted work without relying on the chat history alone.
+ChatGPT Web Harness is a durable workflow skill for long-running tasks in ChatGPT Web. It keeps workflow state in the workspace, issues one-use execution tokens, records evidence for acceptance criteria, persists exact runtime action permissions, and resumes interrupted work without relying on the chat history alone.
 
 The skill uses a small `SKILL.md` as its entry point and deterministic Node.js scripts as the workflow runtime. Invalid transitions fail closed, completed work can be re-evaluated when validated knowledge changes, and every released final response includes a locally verifiable delivery receipt.
 
 Before release, an offline audit derived from `MrGeDiao/shuorenhua` checks the final body for deterministic writing violations and discloses a semantic checklist. The response cannot enter the release state until both checks pass.
+
+The runtime uses two enforcement layers. ChatGPT Web project instructions require the model to start the runtime before task reasoning. The bundled scripts enforce every later runtime action against the last persisted `allowed_next_calls`. A skill ZIP cannot block host text or host tools before the first script call, so the initial start order remains a project-instruction guarantee.
 
 ## Use with ChatGPT Web
 
@@ -14,10 +16,27 @@ Before release, an offline audit derived from `MrGeDiao/shuorenhua` checks the f
 4. Open **Project settings** and set the project instructions to:
 
 ```text
-Always follow the chatgpt-web-harness skill in the latest ZIP attached to this project. Treat its SKILL.md and bundled scripts as authoritative for every chat and task in this project. Start each new task with the workflow required by that skill. When my message contains skill-continue-or-finalize, follow the skill's recovery instructions before any other action.
+Always follow the chatgpt-web-harness skill in the latest ZIP attached to this project. Treat its SKILL.md and bundled scripts as authoritative for every chat and task in this project. After reading the latest SKILL.md, do not send a status update or inspect other files. Immediately start each new task with the workflow required by that skill. When my message contains skill-continue-or-finalize, follow the skill's recovery instructions before any other action.
 ```
 
 5. Start a new chat inside the project and send your task.
+
+The correct new-task trace is:
+
+```text
+read latest SKILL.md
+-> workflow.start
+-> workflow.plan
+-> execution token
+-> allowed runtime actions and host tools
+-> workflow.stage
+-> check.open
+-> check.submit
+-> check.consume
+-> send released_response exactly
+```
+
+`allowed_next_calls` contains only callable runtime actions. After delivery, the directive uses `required_output: "send_released_response_exactly"` for the required host response.
 
 ---
 

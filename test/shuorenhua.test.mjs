@@ -102,10 +102,9 @@ test('scope changes at 1000 language units', () => {
   assert.equal(auditShuorenhua('字'.repeat(1000)).scope, 'bounded');
 });
 
-test('stage removes an older draft and returns every writing violation', t => {
+test('failed stage returns every writing violation and preserves its permission', t => {
   const workspace = temporaryWorkspace(t);
   const { evidenceId, runId } = completeSimpleWork(workspace);
-  stage(workspace, evidenceId, 'Task completed.');
 
   const failed = stage(workspace, evidenceId, 'Great question! Studies show this is a game-changer.', 1);
   const outbox = path.join(workspace, '.chatgpt-workflow', 'runs', runId, 'outbox');
@@ -133,6 +132,11 @@ test('check re-audits the frozen draft and reports post-stage replacement', t =>
 
   const result = run(workspace, 'check.mjs', 'open', {}, 1);
   assert.equal(result.error.code, 'CHECK_FAILED');
+  assert.deepEqual(result.error.allowed_next_calls, ['workflow.next']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(
+    path.join(workspace, '.chatgpt-workflow', 'active.json'),
+    'utf8'
+  )).allowed_next_calls, ['workflow.next']);
   assert.ok(result.error.missing.some(value => value.startsWith('shuorenhua:')));
   assert.ok(result.error.violations.some(value => value.rule_id === 'en-sycophancy'));
   assert.ok(result.error.violations.some(value => value.rule_id === 'en-business-jargon'));

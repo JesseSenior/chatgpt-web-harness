@@ -3,7 +3,7 @@ const REPAIRS = {
   BAD_INPUT: 'Provide the missing or invalid fields and retry the same action.',
   NOT_FOUND: 'Use an identifier that exists in the current durable run.',
   NO_ACTIVE_RUN: 'Start a durable run before task work.',
-  LEGACY_STATE_UNVERIFIABLE: 'Start a version 2 run; legacy evidence cannot be trusted automatically.',
+  LEGACY_STATE_UNVERIFIABLE: 'Start a version 3 run; older state is not supported.',
   INVALID_TRANSITION: 'Read the current state and use one allowed next call.',
   INVALID_PLAN: 'Correct only the reported plan fields and submit the plan again.',
   INVALID_TOKEN: 'Recover the run to obtain a fresh token for the current item.',

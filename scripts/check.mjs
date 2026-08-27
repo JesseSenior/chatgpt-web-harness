@@ -4,9 +4,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { canonical, lastEventHash, sha256, verifyEventChain } from './audit.mjs';
 import {
-  EVIDENCE_TYPES, activeFog, errorCode, event, exists, fail, loadRun, nextCounter,
-  now, ok, openItems, pad, parseInput, randomToken, readJson, readText, saveActive,
-  saveWorkflow, writeJson, writeText
+  EVIDENCE_TYPES, activeFog, authorizeAction, errorCode, event, exists, fail, loadRun,
+  nextCounter, now, ok, openItems, pad, parseInput, permissionStateFailures, randomToken,
+  readJson, readText, saveActive, saveWorkflow, writeJson, writeText
 } from './lib.mjs';
 import { verifyEvidenceId, verifiedEvidenceForCriterion } from './evidence-lib.mjs';
 import {
@@ -134,6 +134,7 @@ function mechanical(active, dir, wf, draft) {
   }
   if (!audit.valid) failures.push(...audit.failures.map(value => `audit:${value}`));
   if (audit.valid && audit.replay_state !== active.state) failures.push('audit:active state mismatch');
+  if (audit.valid) failures.push(...permissionStateFailures(active, audit).map(value => `audit:${value}`));
   return { pass: failures.length === 0, failures, audit, shuorenhua };
 }
 
@@ -182,7 +183,8 @@ function remediation(active, dir, wf, checkRecord, failures, violations = []) {
     wf,
     missing: failures,
     allowed: ['workflow.next'],
-    violations
+    violations,
+    transition: true
   });
 }
 
@@ -371,8 +373,9 @@ function consume(active, dir, wf, input) {
   return ok({
     active,
     wf,
-    allowed: ['send released_response exactly', 'check.redeliver', 'check.verify'],
+    allowed: ['check.redeliver', 'check.verify'],
     extra: {
+      required_output: 'send_released_response_exactly',
       released_response: delivery.releasedResponse,
       receipt_sha256: delivery.record.receipt_sha256,
       delivery_id: delivery.record.delivery_sequence
@@ -393,8 +396,9 @@ function redeliver(active, dir, wf) {
   return ok({
     active,
     wf,
-    allowed: ['send released_response exactly', 'check.redeliver', 'check.verify'],
+    allowed: ['check.redeliver', 'check.verify'],
     extra: {
+      required_output: 'send_released_response_exactly',
       released_response: delivery.releasedResponse,
       receipt_sha256: delivery.record.receipt_sha256,
       delivery_id: delivery.record.delivery_sequence
@@ -426,8 +430,9 @@ function verifyReceipt(active, dir, wf, input) {
   const receipt = String(input.receipt || '').replace(/^sha256:/i, '').trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(receipt)) return fail('RECEIPT_INVALID', { active, wf, missing: ['receipt'] });
   const audit = verifyEventChain(dir);
-  if (!audit.valid || audit.replay_state !== active.state) {
-    return fail('RECEIPT_INVALID', { active, wf, missing: audit.failures });
+  const permissionFailures = audit.valid ? permissionStateFailures(active, audit) : [];
+  if (!audit.valid || audit.replay_state !== active.state || permissionFailures.length) {
+    return fail('RECEIPT_INVALID', { active, wf, missing: [...audit.failures, ...permissionFailures] });
   }
   const delivery = deliveryRecords(dir, audit.events).find(record => record.receipt_sha256 === receipt);
   if (!delivery) return fail('RECEIPT_INVALID', { active, wf, missing: [receipt] });
@@ -475,9 +480,18 @@ function verifyReceipt(active, dir, wf, input) {
 function main() {
   const action = process.argv[2];
   if (!action) return fail('BAD_USAGE');
+  let context = null;
   try {
+    context = loadRun();
+    const { active, dir, wf } = context;
+    const authorization = authorizeAction(active, dir, `check.${action}`);
+    if (!authorization.valid) {
+      const code = action === 'verify' && authorization.code === 'RUNTIME_ERROR'
+        ? 'RECEIPT_INVALID'
+        : authorization.code;
+      return fail(code, { active, wf, detail: authorization.detail });
+    }
     const input = parseInput();
-    const { active, dir, wf } = loadRun();
     if (action === 'open') return openCheck(active, dir, wf);
     if (action === 'submit') return submitCheck(active, dir, wf, input);
     if (action === 'consume') return consume(active, dir, wf, input);
@@ -485,7 +499,11 @@ function main() {
     if (action === 'verify') return verifyReceipt(active, dir, wf, input);
     return fail('BAD_USAGE', { active, wf });
   } catch (error) {
-    return fail(errorCode(error), { detail: error.message });
+    return fail(errorCode(error), {
+      active: context?.active,
+      wf: context?.wf,
+      detail: error.message
+    });
   }
 }
 

@@ -104,9 +104,14 @@ test('knowledge items require reconciliation and validated knowledge for cascade
     criterion_results: [{ criterion_id: 'found', evidence_ids: [evidenceId] }]
   });
   assert.equal(completed.directive.state, 'RECONCILE');
+  const recoveredReconcile = run(workspace, 'recover.mjs', null, {
+    message: 'skill-continue-or-finalize'
+  });
+  assert.deepEqual(recoveredReconcile.directive.allowed_next_calls, completed.directive.allowed_next_calls);
+  const reconcileToken = recoveredReconcile.directive.reconcile_token;
 
   const unreasonable = run(workspace, 'workflow.mjs', 'reconcile', {
-    reconcile_token: completed.directive.reconcile_token,
+    reconcile_token: reconcileToken,
     decision: 'expand',
     reason_code: 'context_limit',
     items: [{
@@ -127,7 +132,7 @@ test('knowledge items require reconciliation and validated knowledge for cascade
   });
   const observationId = observed.directive.observation.id;
   const rejected = run(workspace, 'workflow.mjs', 'reconcile', {
-    reconcile_token: completed.directive.reconcile_token,
+    reconcile_token: reconcileToken,
     decision: 'supersede',
     reason_code: 'high_confidence_observation',
     observation_ids: [observationId],
@@ -141,7 +146,7 @@ test('knowledge items require reconciliation and validated knowledge for cascade
     evidence_ids: [evidenceId]
   });
   const reconciled = run(workspace, 'workflow.mjs', 'reconcile', {
-    reconcile_token: completed.directive.reconcile_token,
+    reconcile_token: reconcileToken,
     decision: 'supersede',
     reason_code: 'validated_observation',
     observation_ids: [observationId],
@@ -182,7 +187,7 @@ test('prepared external effects block recovery and completion until verified', t
     execution_token: token,
     criterion_results: []
   }, 1);
-  assert.equal(blocked.error.code, 'PENDING_EFFECT');
+  assert.equal(blocked.error.code, 'INVALID_TRANSITION');
 
   const evidenceId = requestEvidence(workspace);
   run(workspace, 'workflow.mjs', 'effect_complete', {
@@ -190,7 +195,7 @@ test('prepared external effects block recovery and completion until verified', t
     evidence_id: evidenceId
   });
   const completed = run(workspace, 'workflow.mjs', 'complete', {
-    execution_token: token,
+    execution_token: recovered.directive.execution_token,
     criterion_results: [{ criterion_id: 'done', evidence_ids: [evidenceId] }]
   });
   assert.equal(completed.directive.state, 'CHECK');
@@ -223,17 +228,21 @@ test('legacy state fails closed', t => {
   assert.equal(result.error.code, 'LEGACY_STATE_UNVERIFIABLE');
 });
 
-test('invalidated evidence cannot be restored by ordinary verification', t => {
+test('unadvertised evidence invalidation is rejected without changing evidence', t => {
   const workspace = temporaryWorkspace(t);
   start(workspace);
   const planned = run(workspace, 'workflow.mjs', 'plan', simplePlan());
   const evidenceId = requestEvidence(workspace);
-  run(workspace, 'evidence.mjs', 'invalidate', { id: evidenceId, reason: 'source withdrawn' });
-  const verified = run(workspace, 'evidence.mjs', 'verify', { id: evidenceId }, 1);
-  assert.equal(verified.error.code, 'EVIDENCE_INVALID');
+  const invalidated = run(workspace, 'evidence.mjs', 'invalidate', {
+    id: evidenceId,
+    reason: 'source withdrawn'
+  }, 1);
+  assert.equal(invalidated.error.code, 'INVALID_TRANSITION');
+  const verified = run(workspace, 'evidence.mjs', 'verify', { id: evidenceId });
+  assert.equal(verified.directive.evidence.status, 'verified');
   const completed = run(workspace, 'workflow.mjs', 'complete', {
     execution_token: planned.directive.execution_token,
     criterion_results: [{ criterion_id: 'done', evidence_ids: [evidenceId] }]
-  }, 1);
-  assert.equal(completed.error.code, 'EVIDENCE_REQUIRED');
+  });
+  assert.equal(completed.directive.state, 'CHECK');
 });

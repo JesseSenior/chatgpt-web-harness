@@ -1,11 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { appendEvent, sha256 } from './audit.mjs';
+import {
+  appendEvent, canonical, lastEventHash, permissionDigest, sha256, verifyEventChain
+} from './audit.mjs';
 import { success, failure } from './protocol.mjs';
 
 export const STATE_DIR = '.chatgpt-workflow';
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 export const EVIDENCE_TYPES = new Set(['request', 'artifact', 'tool_result', 'source_snapshot']);
 export const OPEN_STATUSES = new Set(['queued', 'running', 'blocked']);
 export const RECEIPT_PATTERN = /(?:^|\n)Workflow-Receipt:\s*sha256:[a-f0-9]{64}\s*$/i;
@@ -37,6 +39,10 @@ export function writeText(file, value) { atomicWrite(file, String(value)); }
 export function writeJson(file, value) { atomicWrite(file, JSON.stringify(value, null, 2) + '\n'); }
 export function pad(value, width = 6) { return String(value).padStart(width, '0'); }
 
+export function normalizeAllowedCalls(values = []) {
+  return Array.isArray(values) ? [...new Set(values.map(String))].sort() : [];
+}
+
 export function parseInput(index = 3) {
   const argument = process.argv[index];
   if (argument) return JSON.parse(argument);
@@ -50,6 +56,16 @@ export function loadActive(cwd = process.cwd()) {
   const active = readJson(file);
   if (active.version !== SCHEMA_VERSION) {
     throw Object.assign(new Error('legacy state cannot be verified'), { code: 'LEGACY_STATE_UNVERIFIABLE' });
+  }
+  const allowed = normalizeAllowedCalls(active.allowed_next_calls);
+  if (
+    !Array.isArray(active.allowed_next_calls)
+    || canonical(active.allowed_next_calls) !== canonical(allowed)
+    || !Number.isInteger(active.permission_revision)
+    || active.permission_revision < 1
+    || active.permission_sha256 !== permissionDigest(active.permission_revision, allowed)
+  ) {
+    throw Object.assign(new Error('permission state cannot be verified'), { code: 'LEGACY_STATE_UNVERIFIABLE' });
   }
   return active;
 }
@@ -89,6 +105,49 @@ export function event(dir, type, active, payload = {}) {
     state_after: payload.state_after ?? active.state,
     ...payload
   });
+}
+
+export function permissionStateFailures(active, audit) {
+  const replay = audit.replay_permission;
+  const failures = [];
+  if (!replay) return ['missing permission event'];
+  if (replay.permission_revision !== active.permission_revision) failures.push('permission revision mismatch');
+  if (replay.permission_sha256 !== active.permission_sha256) failures.push('permission hash mismatch');
+  if (canonical(replay.allowed_next_calls) !== canonical(active.allowed_next_calls)) {
+    failures.push('permission calls mismatch');
+  }
+  return failures;
+}
+
+export function authorizeAction(active, dir, action, { bypass = false } = {}) {
+  const audit = verifyEventChain(dir);
+  const failures = [
+    ...audit.failures,
+    ...(audit.valid ? permissionStateFailures(active, audit) : [])
+  ];
+  if (audit.valid && audit.replay_state !== active.state) failures.push('active state mismatch');
+  if (failures.length) {
+    return { valid: false, code: 'RUNTIME_ERROR', detail: failures.join('; ') };
+  }
+  if (bypass || active.allowed_next_calls.includes(action)) return { valid: true };
+  return { valid: false, code: 'INVALID_TRANSITION', detail: `action is not allowed: ${action}` };
+}
+
+export function issuePermissions(active, allowed, cwd = process.cwd()) {
+  const calls = normalizeAllowedCalls(allowed);
+  const revision = (active.permission_revision || 0) + 1;
+  const digest = permissionDigest(revision, calls);
+  active.permission_revision = revision;
+  active.allowed_next_calls = calls;
+  active.permission_sha256 = digest;
+  const dir = runDir(active.run_id, cwd);
+  event(dir, 'permissions_issued', active, {
+    permission_revision: revision,
+    allowed_next_calls: calls,
+    permission_sha256: digest
+  });
+  saveActive(active, cwd);
+  return calls;
 }
 
 export function openItems(wf) { return wf.items.filter(item => OPEN_STATUSES.has(item.status)); }
@@ -273,9 +332,22 @@ export function regenerateCurrent(dir, wf) {
 }
 
 export function emit(value) { process.stdout.write(JSON.stringify(value, null, 2) + '\n'); }
-export function ok(options) { emit(success(options)); }
+export function ok(options) {
+  const allowed = options.active
+    ? issuePermissions(options.active, options.allowed)
+    : normalizeAllowedCalls(options.allowed);
+  const extra = options.active && options.extra?.audit_head_sha256
+    ? { ...options.extra, audit_head_sha256: lastEventHash(runDir(options.active.run_id)) }
+    : options.extra;
+  emit(success({ ...options, allowed, extra }));
+}
 export function fail(code, options = {}) {
-  emit(failure(code, options));
+  const allowed = options.active
+    ? (options.transition
+        ? issuePermissions(options.active, options.allowed)
+        : options.active.allowed_next_calls)
+    : normalizeAllowedCalls(options.allowed);
+  emit(failure(code, { ...options, allowed }));
   process.exitCode = 1;
 }
 export function errorCode(error) {

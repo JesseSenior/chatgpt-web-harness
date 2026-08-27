@@ -4,7 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   SCHEMA_VERSION, RECEIPT_PATTERN, activeFog, activePath, dependenciesDone, ensureDir,
-  errorCode, event, exists, fail, issueExecutionToken, issueReconcileToken, loadRun,
+  authorizeAction, errorCode, event, exists, fail, issueExecutionToken, issueReconcileToken, loadRun,
   makeRunId, nextCounter, nextRunnable, normalizeDestination, normalizeFog,
   normalizePlanItems, now, ok, openItems, pad, parseInput, readJson,
   root, runDir, saveActive, saveWorkflow, sha256, validateExecutionToken,
@@ -100,7 +100,13 @@ function reconcileDirective(active, dir, wf, sourceItemId, eventName, stateBefor
   return ok({
     active,
     wf,
-    allowed: ['workflow.reconcile', 'workflow.regenerate', 'observe.validate', 'observe.status'],
+    allowed: [
+      'workflow.reconcile',
+      'workflow.regenerate',
+      'observe.capture',
+      'observe.validate',
+      'observe.status'
+    ],
     extra: {
       reconcile_token: token,
       source_item_id: sourceItemId,
@@ -133,9 +139,9 @@ function advance(active, dir, wf, eventName, stateBefore, payload = {}) {
 function start(input) {
   if (!input.request || typeof input.request !== 'string') return fail('BAD_INPUT', { missing: ['request'] });
   ensureDir(root());
-  if (exists(activePath()) && !input.force_new) {
+  if (exists(activePath())) {
     const current = readJson(activePath());
-    return fail('INVALID_TRANSITION', { detail: `active run exists: ${current.run_id}`, allowed: ['workflow.interrupt', 'recover'] });
+    return fail('INVALID_TRANSITION', { detail: `active run exists: ${current.run_id}`, allowed: ['recover'] });
   }
   const runId = makeRunId();
   const dir = runDir(runId);
@@ -488,8 +494,18 @@ function effectComplete(active, dir, wf, input) {
   const data = effects(dir);
   const record = data.effects.find(effect => effect.operation_id === String(input.operation_id || ''));
   if (!record) return fail('NOT_FOUND', { active, wf, missing: [String(input.operation_id || '')] });
+  if (
+    active.state !== 'EXECUTE'
+    || record.status !== 'prepared'
+    || record.workflow_item_id !== wf.current_item_id
+  ) {
+    return fail('INVALID_TRANSITION', { active, wf, detail: 'effect is not prepared for the current item' });
+  }
   const evidence = verifyEvidenceId(active, dir, Number(input.evidence_id));
   if (!evidence.valid) return fail('EVIDENCE_INVALID', { active, wf, missing: [String(input.evidence_id || '')] });
+  if (evidence.record.workflow_item_id !== wf.current_item_id) {
+    return fail('EVIDENCE_INVALID', { active, wf, missing: ['evidence for current item'] });
+  }
   record.status = 'completed';
   record.evidence_id = evidence.record.id;
   record.completed_at = now();
@@ -567,7 +583,7 @@ function status(active, dir, wf) {
   return ok({
     active,
     wf,
-    allowed: ['recover', 'workflow.next', 'workflow.reconcile', 'workflow.stage'],
+    allowed: active.allowed_next_calls,
     extra: {
       current: path.join(dir, 'CURRENT.md'),
       open_items: openItems(wf),
@@ -580,10 +596,16 @@ function status(active, dir, wf) {
 function main() {
   const action = process.argv[2];
   if (!action) return fail('BAD_USAGE');
+  let context = null;
   try {
+    if (action === 'start') return start(parseInput());
+    context = loadRun();
+    const { active, dir, wf } = context;
+    const authorization = authorizeAction(active, dir, `workflow.${action}`);
+    if (!authorization.valid) {
+      return fail(authorization.code, { active, wf, detail: authorization.detail });
+    }
     const input = parseInput();
-    if (action === 'start') return start(input);
-    const { active, dir, wf } = loadRun();
     if (action === 'plan') return plan(active, dir, wf, input);
     if (action === 'next') return next(active, dir, wf);
     if (action === 'complete') return complete(active, dir, wf, input);
@@ -598,7 +620,11 @@ function main() {
     if (action === 'status') return status(active, dir, wf);
     return fail('BAD_USAGE', { active, wf });
   } catch (error) {
-    return fail(errorCode(error), { detail: error.message });
+    return fail(errorCode(error), {
+      active: context?.active,
+      wf: context?.wf,
+      detail: error.message
+    });
   }
 }
 

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   finishSimpleWorkflow, prepareSimpleRelease, run, simplePlan, start, requestEvidence, temporaryWorkspace
 } from './helpers.mjs';
+import { lastEventHash, permissionDigest } from '../scripts/audit.mjs';
 
 function responseBody(value) {
   return value.replace(/\n\nWorkflow-Receipt:\s*sha256:[a-f0-9]{64}\s*$/i, '');
@@ -15,9 +16,12 @@ test('final delivery is frozen while every delivery receipt is unique and verifi
   const { consumed } = finishSimpleWorkflow(workspace);
   const firstReceipt = consumed.directive.receipt_sha256;
   assert.match(consumed.directive.released_response, /Workflow-Receipt: sha256:[a-f0-9]{64}$/);
+  assert.equal(consumed.directive.required_output, 'send_released_response_exactly');
+  assert.deepEqual(consumed.directive.allowed_next_calls, ['check.redeliver', 'check.verify']);
 
   const second = run(workspace, 'check.mjs', 'redeliver');
   assert.notEqual(second.directive.receipt_sha256, firstReceipt);
+  assert.equal(second.directive.required_output, 'send_released_response_exactly');
   assert.equal(responseBody(second.directive.released_response), responseBody(consumed.directive.released_response));
 
   const verified = run(workspace, 'check.mjs', 'verify', {
@@ -25,6 +29,10 @@ test('final delivery is frozen while every delivery receipt is unique and verifi
     content: consumed.directive.released_response
   });
   assert.equal(verified.directive.valid, true);
+  assert.equal(
+    verified.directive.audit_head_sha256,
+    lastEventHash(path.join(workspace, '.chatgpt-workflow', 'runs', consumed.directive.run_id))
+  );
 });
 
 test('receipt verification detects event-chain tampering', t => {
@@ -40,6 +48,22 @@ test('receipt verification detects event-chain tampering', t => {
     receipt: consumed.directive.receipt_sha256
   }, 1);
   assert.equal(result.error.code, 'RECEIPT_INVALID');
+});
+
+test('receipt verification rejects active permission state that diverges from the event chain', t => {
+  const workspace = temporaryWorkspace(t);
+  const { consumed } = finishSimpleWorkflow(workspace);
+  const activeFile = path.join(workspace, '.chatgpt-workflow', 'active.json');
+  const active = JSON.parse(fs.readFileSync(activeFile, 'utf8'));
+  active.allowed_next_calls = ['check.redeliver', 'check.verify', 'workflow.status'];
+  active.permission_sha256 = permissionDigest(active.permission_revision, active.allowed_next_calls);
+  fs.writeFileSync(activeFile, `${JSON.stringify(active, null, 2)}\n`);
+
+  const result = run(workspace, 'check.mjs', 'verify', {
+    receipt: consumed.directive.receipt_sha256
+  }, 1);
+  assert.equal(result.error.code, 'RECEIPT_INVALID');
+  assert.match(result.error.detail, /permission (hash|calls) mismatch/);
 });
 
 test('READY recovery rotates the release token and audit can restore a delivery projection', t => {

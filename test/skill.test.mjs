@@ -12,9 +12,9 @@ test('SKILL.md stays short and routes continuation to the runtime', () => {
   assert.doesNotMatch(skill, /references\//);
 });
 
-test('package exposes version 0.3 and the Node test command', () => {
+test('package exposes version 0.4 and the Node test command', () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(PROJECT, 'package.json'), 'utf8'));
-  assert.equal(packageJson.version, '0.3.0');
+  assert.equal(packageJson.version, '0.4.0');
   assert.equal(packageJson.scripts.test, 'node --test');
 });
 

@@ -2,12 +2,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  activeFog, errorCode, event, fail, issueExecutionToken, issueReconcileToken, loadRun,
+  activeFog, authorizeAction, errorCode, event, fail, issueExecutionToken, issueReconcileToken, loadRun,
   nextRunnable, ok, randomToken, readJson, saveActive, saveWorkflow, sha256, writeJson
 } from './lib.mjs';
 import { interruptRun } from './workflow.mjs';
 
 const CONTINUE_PATTERN = /skill-continue-or-finalize/gi;
+const CONTINUE_TRIGGER = /skill-continue-or-finalize/i;
 
 function input() {
   const argument = process.argv[2];
@@ -34,6 +35,12 @@ function rotateReleaseToken(active, dir) {
 function recover(inputValue) {
   let { active, dir, wf } = loadRun();
   const message = String(inputValue.message || '');
+  const authorization = authorizeAction(active, dir, 'recover', {
+    bypass: CONTINUE_TRIGGER.test(message)
+  });
+  if (!authorization.valid) {
+    return fail(authorization.code, { active, wf, detail: authorization.detail });
+  }
   if (CONTINUE_PATTERN.test(message)) {
     CONTINUE_PATTERN.lastIndex = 0;
     const remainder = message.replace(CONTINUE_PATTERN, '').trim();
@@ -48,11 +55,19 @@ function recover(inputValue) {
   if (active.state === 'EXECUTE') {
     const pending = preparedEffects(dir);
     if (pending.length) {
+      const item = wf.items.find(candidate => candidate.id === wf.current_item_id);
+      if (!item) return fail('RUNTIME_ERROR', { active, wf, detail: 'prepared effect has no current item' });
+      const issued = issueExecutionToken(active, dir, wf, item);
+      event(dir, 'execution_reissued', active, {
+        state_before: 'EXECUTE',
+        state_after: 'EXECUTE',
+        item_id: item.id
+      });
       return ok({
         active,
         wf,
         allowed: ['evidence.record', 'workflow.effect_complete'],
-        extra: { pending_effects: pending }
+        extra: { pending_effects: pending, execution_token: issued.token, item }
       });
     }
     const item = wf.items.find(candidate => candidate.id === wf.current_item_id) || nextRunnable(wf);
@@ -83,7 +98,14 @@ function recover(inputValue) {
       active,
       wf,
       nextItem: item,
-      allowed: ['evidence.record', 'observe.capture', 'workflow.effect_prepare', 'workflow.complete', 'workflow.block'],
+      allowed: [
+        'evidence.record',
+        'observe.capture',
+        'workflow.effect_prepare',
+        'workflow.complete',
+        'workflow.block',
+        'workflow.snapshot'
+      ],
       extra: { execution_token: issued.token, item }
     });
   }
@@ -99,7 +121,13 @@ function recover(inputValue) {
     return ok({
       active,
       wf,
-      allowed: ['workflow.reconcile', 'observe.validate'],
+      allowed: [
+        'workflow.reconcile',
+        'workflow.regenerate',
+        'observe.capture',
+        'observe.validate',
+        'observe.status'
+      ],
       extra: { reconcile_token: token, source_item_id: sourceItemId, fog: activeFog(wf) }
     });
   }

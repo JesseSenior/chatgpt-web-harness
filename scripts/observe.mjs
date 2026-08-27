@@ -2,7 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  errorCode, event, exists, fail, loadRun, nextCounter, now, ok, pad, parseInput, readJson, writeJson
+  authorizeAction, errorCode, event, exists, fail, loadRun, nextCounter, now, ok, pad,
+  parseInput, readJson, writeJson
 } from './lib.mjs';
 import { verifyEvidenceId } from './evidence-lib.mjs';
 
@@ -53,10 +54,19 @@ function capture(active, dir, wf, input) {
   };
   writeJson(observationPath(dir, id), record);
   event(dir, 'observation_captured', active, { observation_id: id, confidence });
+  const allowed = active.state === 'RECONCILE'
+    ? [
+        'workflow.reconcile',
+        'workflow.regenerate',
+        'observe.capture',
+        'observe.validate',
+        'observe.status'
+      ]
+    : ['observe.validate', 'workflow.complete', 'observe.capture'];
   return ok({
     active,
     wf,
-    allowed: ['observe.validate', 'workflow.complete', 'observe.capture'],
+    allowed,
     extra: { observation: record }
   });
 }
@@ -73,7 +83,16 @@ function validate(active, dir, wf, input) {
   record.updated_at = now();
   writeJson(observationPath(dir, record.id), record);
   event(dir, 'observation_validated', active, { observation_id: record.id });
-  return ok({ active, wf, allowed: ['workflow.reconcile', 'workflow.complete'], extra: { observation: record } });
+  const allowed = active.state === 'RECONCILE'
+    ? [
+        'workflow.reconcile',
+        'workflow.regenerate',
+        'observe.capture',
+        'observe.validate',
+        'observe.status'
+      ]
+    : ['workflow.complete'];
+  return ok({ active, wf, allowed, extra: { observation: record } });
 }
 
 function supersede(active, dir, wf, input) {
@@ -92,22 +111,32 @@ function status(active, dir, wf) {
   const records = exists(directory)
     ? fs.readdirSync(directory).filter(name => /^\d{6}\.json$/.test(name)).sort().map(name => readJson(path.join(directory, name)))
     : [];
-  return ok({ active, wf, allowed: ['observe.capture', 'observe.validate'], extra: { observations: records } });
+  return ok({ active, wf, allowed: active.allowed_next_calls, extra: { observations: records } });
 }
 
 function main() {
   const action = process.argv[2];
   if (!action) return fail('BAD_USAGE');
+  let context = null;
   try {
+    context = loadRun();
+    const { active, dir, wf } = context;
+    const authorization = authorizeAction(active, dir, `observe.${action}`);
+    if (!authorization.valid) {
+      return fail(authorization.code, { active, wf, detail: authorization.detail });
+    }
     const input = parseInput();
-    const { active, dir, wf } = loadRun();
     if (action === 'capture') return capture(active, dir, wf, input);
     if (action === 'validate' || action === 'promote') return validate(active, dir, wf, input);
     if (action === 'supersede') return supersede(active, dir, wf, input);
     if (action === 'status') return status(active, dir, wf);
     return fail('BAD_USAGE', { active, wf });
   } catch (error) {
-    return fail(errorCode(error), { detail: error.message });
+    return fail(errorCode(error), {
+      active: context?.active,
+      wf: context?.wf,
+      detail: error.message
+    });
   }
 }
 
