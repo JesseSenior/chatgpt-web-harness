@@ -81,7 +81,8 @@ export function prepareSimpleRelease(workspace) {
     answers: [
       { id: 'destination-answer', answer: 'yes', evidence_ids: [evidenceId] },
       { id: 'user-constraints', answer: 'yes', evidence_ids: [evidenceId] },
-      { id: 'grounded-claims', answer: 'yes', evidence_ids: [evidenceId] }
+      { id: 'grounded-claims', answer: 'yes', evidence_ids: [evidenceId] },
+      { id: 'shuorenhua-style', answer: 'yes', evidence_ids: [evidenceId] }
     ]
   });
   return { evidenceId, submitted };

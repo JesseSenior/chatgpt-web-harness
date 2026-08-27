@@ -9,12 +9,28 @@ import {
   saveWorkflow, writeJson, writeText
 } from './lib.mjs';
 import { verifyEvidenceId, verifiedEvidenceForCriterion } from './evidence-lib.mjs';
+import {
+  SHUORENHUA_SEMANTIC_CHECKS, SHUORENHUA_SOURCE, auditShuorenhua
+} from './shuorenhua.mjs';
 
-const MODEL_CHECKS = [
+const BASE_MODEL_CHECKS = [
   { id: 'destination-answer', text: 'The final response answers the stable destination.' },
   { id: 'user-constraints', text: 'The final response satisfies the persisted user constraints.' },
   { id: 'grounded-claims', text: 'Material final-response claims are supported by verified evidence.' }
 ];
+
+function modelChecks(shuorenhua) {
+  return [
+    ...BASE_MODEL_CHECKS,
+    {
+      id: 'shuorenhua-style',
+      text: 'The final response passes the complete offline shuorenhua semantic audit.',
+      source_commit: SHUORENHUA_SOURCE.commit,
+      audit_sha256: shuorenhua.audit_sha256,
+      checklist: SHUORENHUA_SEMANTIC_CHECKS
+    }
+  ];
+}
 
 function draftState(dir) {
   const bodyFile = path.join(dir, 'outbox', 'draft.md');
@@ -37,6 +53,32 @@ function loadRelease(dir, id) {
   const bodyFile = releaseBodyPath(dir, id);
   if (!exists(metaFile) || !exists(bodyFile)) return null;
   return { meta: readJson(metaFile), body: readText(bodyFile) };
+}
+
+function releaseIntegrityFailures(release, eventAudit) {
+  const writingAudit = auditShuorenhua(release.body);
+  const readyEvent = eventAudit.events.find(record =>
+    record.type === 'check_ready' && record.payload.release_id === release.meta.id
+  );
+  const failures = [];
+  if (sha256(release.body) !== release.meta.body_sha256) failures.push('release body');
+  if (!writingAudit.pass) {
+    failures.push(...writingAudit.violations.map(value => `shuorenhua:${value.rule_id}:${value.line}:${value.column}`));
+  }
+  if (writingAudit.audit_sha256 !== release.meta.shuorenhua_audit_sha256) failures.push('shuorenhua audit');
+  if (writingAudit.source_commit !== release.meta.shuorenhua_source_commit) failures.push('shuorenhua source');
+  if (!readyEvent) {
+    failures.push('check_ready event');
+  } else {
+    if (readyEvent.payload.body_sha256 !== release.meta.body_sha256) failures.push('check_ready body');
+    if (readyEvent.payload.shuorenhua_audit_sha256 !== release.meta.shuorenhua_audit_sha256) {
+      failures.push('check_ready shuorenhua audit');
+    }
+    if (readyEvent.payload.shuorenhua_source_commit !== release.meta.shuorenhua_source_commit) {
+      failures.push('check_ready shuorenhua source');
+    }
+  }
+  return failures;
 }
 
 function effectFailures(dir) {
@@ -69,6 +111,7 @@ function coverageFailures(active, dir, wf, draft) {
 
 function mechanical(active, dir, wf, draft) {
   const audit = verifyEventChain(dir);
+  const shuorenhua = draft ? auditShuorenhua(draft.body) : null;
   const failures = [];
   if (!draft) failures.push('missing-draft');
   if (draft && draft.meta.body_sha256 !== draft.body_sha256) failures.push('draft-hash');
@@ -80,12 +123,21 @@ function mechanical(active, dir, wf, draft) {
   failures.push(...effectFailures(dir).map(id => `pending-effect:${id}`));
   failures.push(...itemEvidenceFailures(active, dir, wf).map(id => `item-evidence:${id}`));
   if (draft) failures.push(...coverageFailures(active, dir, wf, draft).map(id => `destination-evidence:${id}`));
+  if (shuorenhua && !shuorenhua.pass) {
+    failures.push(...shuorenhua.violations.map(value => `shuorenhua:${value.rule_id}:${value.line}:${value.column}`));
+  }
+  if (shuorenhua && draft.meta.shuorenhua_audit_sha256 !== shuorenhua.audit_sha256) {
+    failures.push('shuorenhua:audit-hash');
+  }
+  if (shuorenhua && draft.meta.shuorenhua_source_commit !== shuorenhua.source_commit) {
+    failures.push('shuorenhua:source-commit');
+  }
   if (!audit.valid) failures.push(...audit.failures.map(value => `audit:${value}`));
   if (audit.valid && audit.replay_state !== active.state) failures.push('audit:active state mismatch');
-  return { pass: failures.length === 0, failures, audit };
+  return { pass: failures.length === 0, failures, audit, shuorenhua };
 }
 
-function remediation(active, dir, wf, checkRecord, failures) {
+function remediation(active, dir, wf, checkRecord, failures, violations = []) {
   checkRecord.status = 'BLOCKED';
   checkRecord.failures = failures;
   checkRecord.completed_at = now();
@@ -125,7 +177,13 @@ function remediation(active, dir, wf, checkRecord, failures) {
     check_id: checkRecord.id,
     failures
   });
-  return fail('CHECK_FAILED', { active, wf, missing: failures, allowed: ['workflow.next'] });
+  return fail('CHECK_FAILED', {
+    active,
+    wf,
+    missing: failures,
+    allowed: ['workflow.next'],
+    violations
+  });
 }
 
 function openCheck(active, dir, wf) {
@@ -136,6 +194,7 @@ function openCheck(active, dir, wf) {
     return fail('RUNTIME_ERROR', { active, wf, missing: result.failures.filter(value => value.startsWith('audit:')) });
   }
   const id = nextCounter(dir, 'check');
+  const checks = result.shuorenhua ? modelChecks(result.shuorenhua) : BASE_MODEL_CHECKS;
   const record = {
     id,
     status: 'OPEN',
@@ -144,13 +203,20 @@ function openCheck(active, dir, wf) {
     request_revision: active.request_revision,
     workflow_revision: wf.revision,
     draft_sha256: draft?.body_sha256 || null,
-    model_checks: MODEL_CHECKS,
+    model_checks: checks,
     mechanical: result
   };
   writeJson(path.join(dir, 'checks', `${pad(id)}.json`), record);
-  if (!result.pass) return remediation(active, dir, wf, record, result.failures);
-  event(dir, 'check_opened', active, { check_id: id, draft_sha256: draft.body_sha256 });
-  return ok({ active, wf, allowed: ['check.submit'], extra: { check_id: id, checks: MODEL_CHECKS } });
+  if (!result.pass) {
+    return remediation(active, dir, wf, record, result.failures, result.shuorenhua?.violations || []);
+  }
+  event(dir, 'check_opened', active, {
+    check_id: id,
+    draft_sha256: draft.body_sha256,
+    shuorenhua_audit_sha256: result.shuorenhua.audit_sha256,
+    shuorenhua_source_commit: result.shuorenhua.source_commit
+  });
+  return ok({ active, wf, allowed: ['check.submit'], extra: { check_id: id, checks } });
 }
 
 function normalizedAnswers(input) {
@@ -173,13 +239,26 @@ function submitCheck(active, dir, wf, input) {
   if (record.status !== 'OPEN') return fail('INVALID_TRANSITION', { active, wf });
   const draft = draftState(dir);
   const mechanicalResult = mechanical(active, dir, wf, draft);
-  if (!mechanicalResult.pass || record.workflow_revision !== wf.revision || record.draft_sha256 !== draft?.body_sha256) {
-    return remediation(active, dir, wf, record, [...mechanicalResult.failures, 'stale-open-check']);
+  const expectedChecks = mechanicalResult.shuorenhua ? modelChecks(mechanicalResult.shuorenhua) : [];
+  if (
+    !mechanicalResult.pass
+    || record.workflow_revision !== wf.revision
+    || record.draft_sha256 !== draft?.body_sha256
+    || canonical(record.model_checks) !== canonical(expectedChecks)
+  ) {
+    return remediation(
+      active,
+      dir,
+      wf,
+      record,
+      [...mechanicalResult.failures, 'stale-open-check'],
+      mechanicalResult.shuorenhua?.violations || []
+    );
   }
   const answers = normalizedAnswers(input);
   const failures = [];
   const storedAnswers = [];
-  for (const check of MODEL_CHECKS) {
+  for (const check of expectedChecks) {
     const answer = answers.get(check.id);
     if (!answer || answer.answer !== 'yes' || answer.evidence_ids.length === 0) {
       failures.push(check.id);
@@ -206,6 +285,8 @@ function submitCheck(active, dir, wf, input) {
     workflow_revision: wf.revision,
     check_id: record.id,
     body_sha256: draft.body_sha256,
+    shuorenhua_audit_sha256: mechanicalResult.shuorenhua.audit_sha256,
+    shuorenhua_source_commit: mechanicalResult.shuorenhua.source_commit,
     token_hash: sha256(releaseToken),
     ready_at: now()
   };
@@ -222,7 +303,9 @@ function submitCheck(active, dir, wf, input) {
     state_after: 'READY',
     check_id: record.id,
     release_id: releaseId,
-    body_sha256: draft.body_sha256
+    body_sha256: draft.body_sha256,
+    shuorenhua_audit_sha256: mechanicalResult.shuorenhua.audit_sha256,
+    shuorenhua_source_commit: mechanicalResult.shuorenhua.source_commit
   });
   return ok({ active, wf, allowed: ['check.consume'], extra: { release_token: releaseToken, release_id: releaseId } });
 }
@@ -239,6 +322,8 @@ function createDelivery(active, dir, wf, release) {
     release_id: release.meta.id,
     delivery_sequence: deliveryId,
     body_sha256: release.meta.body_sha256,
+    shuorenhua_audit_sha256: release.meta.shuorenhua_audit_sha256,
+    shuorenhua_source_commit: release.meta.shuorenhua_source_commit,
     nonce,
     previous_event_sha256: lastEventHash(dir)
   };
@@ -267,8 +352,9 @@ function consume(active, dir, wf, input) {
     return fail('BAD_RELEASE_TOKEN', { active, wf });
   }
   const audit = verifyEventChain(dir);
-  if (!audit.valid || audit.replay_state !== 'READY' || sha256(release.body) !== release.meta.body_sha256) {
-    return fail('RUNTIME_ERROR', { active, wf, missing: audit.failures });
+  const integrityFailures = audit.valid ? releaseIntegrityFailures(release, audit) : [];
+  if (!audit.valid || audit.replay_state !== 'READY' || integrityFailures.length) {
+    return fail('RUNTIME_ERROR', { active, wf, missing: [...audit.failures, ...integrityFailures] });
   }
   release.meta.status = 'consumed';
   release.meta.consumed_at = now();
@@ -298,7 +384,11 @@ function redeliver(active, dir, wf) {
   if (active.state !== 'CONSUMED') return fail('INVALID_TRANSITION', { active, wf, allowed: ['recover'] });
   const release = loadRelease(dir, active.release_id);
   if (!release || release.meta.status !== 'consumed') return fail('NO_FINAL_RELEASE', { active, wf });
-  if (sha256(release.body) !== release.meta.body_sha256) return fail('RUNTIME_ERROR', { active, wf, missing: ['frozen final body'] });
+  const audit = verifyEventChain(dir);
+  const integrityFailures = audit.valid ? releaseIntegrityFailures(release, audit) : [];
+  if (!audit.valid || audit.replay_state !== 'CONSUMED' || integrityFailures.length) {
+    return fail('RUNTIME_ERROR', { active, wf, missing: [...audit.failures, ...integrityFailures] });
+  }
   const delivery = createDelivery(active, dir, wf, release);
   return ok({
     active,
@@ -345,7 +435,14 @@ function verifyReceipt(active, dir, wf, input) {
   void delivered_at;
   if (sha256(canonical(material)) !== stored) return fail('RECEIPT_INVALID', { active, wf, missing: ['receipt material'] });
   const release = loadRelease(dir, delivery.release_id);
-  if (!release || sha256(release.body) !== delivery.body_sha256) {
+  const releaseFailures = release ? releaseIntegrityFailures(release, audit) : ['release body'];
+  if (
+    !release
+    || sha256(release.body) !== delivery.body_sha256
+    || release.meta.shuorenhua_audit_sha256 !== delivery.shuorenhua_audit_sha256
+    || release.meta.shuorenhua_source_commit !== delivery.shuorenhua_source_commit
+    || releaseFailures.length
+  ) {
     return fail('RECEIPT_INVALID', { active, wf, missing: ['release body'] });
   }
   if (input.content) {

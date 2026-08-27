@@ -11,6 +11,7 @@ import {
   validateReconcileToken, writeJson, writeText
 } from './lib.mjs';
 import { recordEvidence, verifiedEvidenceForCriterion, verifyEvidenceId } from './evidence-lib.mjs';
+import { auditShuorenhua } from './shuorenhua.mjs';
 
 const REPLAN_REASONS = new Set([
   'no_change',
@@ -530,6 +531,16 @@ function stage(active, dir, wf, input) {
   }
   if (failures.length) return fail('EVIDENCE_REQUIRED', { active, wf, missing: failures });
   clearCandidate(dir);
+  const shuorenhua = auditShuorenhua(content);
+  if (!shuorenhua.pass) {
+    return fail('SHUORENHUA_FAILED', {
+      active,
+      wf,
+      allowed: ['workflow.stage'],
+      violations: shuorenhua.violations,
+      detail: 'Revise every reported violation before staging the final response again.'
+    });
+  }
   writeText(path.join(dir, 'outbox', 'draft.md'), content);
   writeJson(path.join(dir, 'outbox', 'draft.json'), {
     mode: 'final',
@@ -537,10 +548,18 @@ function stage(active, dir, wf, input) {
     request_revision: active.request_revision,
     workflow_revision: wf.revision,
     body_sha256: sha256(content),
+    shuorenhua_audit_sha256: shuorenhua.audit_sha256,
+    shuorenhua_source_commit: shuorenhua.source_commit,
+    shuorenhua_profile: shuorenhua.profile,
+    shuorenhua_scope: shuorenhua.scope,
     coverage: normalizedCoverage,
     staged_at: now()
   });
-  event(dir, 'response_staged', active, { body_sha256: sha256(content) });
+  event(dir, 'response_staged', active, {
+    body_sha256: sha256(content),
+    shuorenhua_audit_sha256: shuorenhua.audit_sha256,
+    shuorenhua_source_commit: shuorenhua.source_commit
+  });
   return ok({ active, wf, allowed: ['check.open'] });
 }
 

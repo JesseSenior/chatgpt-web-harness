@@ -19,4 +19,6 @@ The runtime owns `.chatgpt-workflow/`. Read it only when directed; mutate it onl
 
 Only final responses use the release gate. Send exactly the `released_response` returned by `check.consume` or `check.redeliver`; it includes the script-generated receipt.
 
+The final body must pass the offline shuorenhua audit in `workflow.stage` and `check.open`. Revise every returned violation, apply every disclosed semantic check, and submit the `shuorenhua-style` answer before release.
+
 If any runtime file, Node.js, or writable workspace is unavailable, stop and report that the durable runtime is unavailable.

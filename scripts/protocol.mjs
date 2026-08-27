@@ -15,6 +15,7 @@ const REPAIRS = {
   PENDING_EFFECT: 'Verify the prepared external effect before retrying or completing the item.',
   WORKFLOW_NOT_EMPTY: 'Complete or invalidate every open item and resolve active fog first.',
   RESERVED_RECEIPT: 'Remove the reserved Workflow-Receipt footer; the runtime adds it during delivery.',
+  SHUORENHUA_FAILED: 'Revise every reported writing violation, then retry the same final response action.',
   CHECK_FAILED: 'Complete the generated remediation work, then stage a new final response.',
   NO_FINAL_RELEASE: 'Complete the final check before requesting delivery.',
   BAD_RELEASE_TOKEN: 'Use the current release token returned by the successful check.',
@@ -43,7 +44,8 @@ export function failure(code, {
   currentItem = null,
   missing = [],
   allowed = [],
-  detail = ''
+  detail = '',
+  violations = []
 } = {}) {
   return {
     ok: false,
@@ -54,6 +56,7 @@ export function failure(code, {
       missing,
       allowed_next_calls: allowed,
       repair: REPAIRS[code] || REPAIRS.RUNTIME_ERROR,
+      ...(violations.length ? { violations } : {}),
       ...(detail ? { detail } : {})
     }
   };

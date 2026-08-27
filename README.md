@@ -4,6 +4,8 @@ ChatGPT Web Harness is a durable workflow skill for long-running tasks in ChatGP
 
 The skill uses a small `SKILL.md` as its entry point and deterministic Node.js scripts as the workflow runtime. Invalid transitions fail closed, completed work can be re-evaluated when validated knowledge changes, and every released final response includes a locally verifiable delivery receipt.
 
+Before release, an offline audit derived from `MrGeDiao/shuorenhua` checks the final body for deterministic writing violations and discloses a semantic checklist. The response cannot enter the release state until both checks pass.
+
 ## Use with ChatGPT Web
 
 1. In ChatGPT Web, select **New project** in the sidebar and create a project for your work.
